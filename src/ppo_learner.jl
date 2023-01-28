@@ -156,12 +156,12 @@ function poststep(a2cl::PPOLearner; returns, steps, rng, kwargs...)
         data = collect_trajectories()
         update_advantates!(data)
         if device == gpu; data = map(dataₜ -> device.(dataₜ), data); end
-        if actor_gpu !== actor; Flux.loadmodel!(actor_gpu, actor); end
-        if critic_gpu !== critic; Flux.loadmodel!(critic_gpu, critic); end
+        if actor_gpu.actor_model !== actor.actor_model; Flux.loadparams!(actor_gpu.actor_model, Flux.params(actor.actor_model)); end
+        if critic_gpu !== critic; Flux.loadparams!(critic_gpu, Flux.params(critic)); end
         ℓθ, H̄, kl_div, num_iters = update_actor_multiple_iters!(actor_gpu, data, max_actor_iters)
         ℓϕ, v̄ = update_critic!(critic_gpu, data)
-        if actor_gpu !== actor; Flux.loadmodel!(actor, actor_gpu); end
-        if critic_gpu !== critic; Flux.loadmodel!(critic, critic_gpu); end
+        if actor_gpu.actor_model !== actor.actor_model; Flux.loadparams!(actor.actor_model, Flux.params(actor_gpu.actor_model)); end
+        if critic_gpu !== critic; Flux.loadparams!(critic, Flux.params(critic_gpu)); end
         return ℓθ, ℓϕ, H̄, kl_div, num_iters, v̄
     end
 
