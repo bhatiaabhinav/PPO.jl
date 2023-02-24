@@ -132,7 +132,7 @@ function poststep(a2cl::PPOLearner; returns, steps, rng, kwargs...)
                         H̄ₜ = -sum(𝛑ₜ .* log𝛑ₜ; dims=1) |> mean
                         actor_loss -= ent_bonus * H̄ₜ
                         H̄ += H̄ₜ
-                        kl_div += kldivergence(𝛑ₜ, old𝛑ₜ)
+                        kl_div += kldivergence(old𝛑ₜ, 𝛑ₜ)
                     end
                     return actor_loss
                 end
