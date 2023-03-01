@@ -51,13 +51,13 @@ function MDPs.preepisode(p::RecurrentActor; kwargs...)
 end
 
 function (p::RecurrentActor{T})(rng::AbstractRNG, o::Vector{T})::Int where {T}
-    𝐬 = reshape(vcat(p.prev_a, p.prev_r, tof32(o), 0f0), :, 1)
+    𝐬 = reshape(vcat(p.prev_a, p.prev_r, tof32(o)), :, 1)
     𝐚 = p(rng, 𝐬)
     return 𝐚[1]
 end
 
 function (p::RecurrentActor{T})(o::Vector{T}, a::Int) where {T}
-    𝐬 = reshape(vcat(p.prev_a, p.prev_r, tof32(o), 0f0), :, 1)
+    𝐬 = reshape(vcat(p.prev_a, p.prev_r, tof32(o)), :, 1)
     return p(𝐬, :)[a, 1]
 end
 
