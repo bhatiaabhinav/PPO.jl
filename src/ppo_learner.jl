@@ -92,21 +92,22 @@ function postepisode(ppo::PPOLearner; returns, steps, rng, kwargs...)
             # ---------------- prepare of next step -------------------
             # set up states:
             𝐬ₜ = copy(𝐬ₜ′)
-            Threads.@threads for i in 1:N
-                if 𝐝ₜ[i] + 𝐭ₜ[i] > 0
+            any_reset = false
+            for i in 1:N
+                if 𝐝ₜ[1, i] + 𝐭ₜ[1, i] > 0
                     reset!(envs[i]; rng=rng);
                     𝐬ₜ[:, i] .= 0f0
                     𝐬ₜ[end-m+1:end, i] .= tof32(state(envs[i]))
+                    any_reset = true
                 end
             end
             # setup rnn states:
-            if isrecurrent
+            if isrecurrent && any_reset
                 set_rnn_state!(critic, 𝐡ₜ_backup)
-                reset_idxs::BitVector = (𝐝ₜ + 𝐭ₜ .> 0)[1, :]
+                reset_idxs::BitVector = ((𝐝ₜ + 𝐭ₜ) .> 0)[1, :]
                 reset_rnn_state!.((actor, critic), (reset_idxs, reset_idxs));
             end
-            # set up value function:
-            𝐯ₜ = critic(𝐬ₜ)
+            𝐯ₜ = any_reset ? critic(𝐬ₜ) : 𝐯ₜ′
             # ---------------------------------------------------------
             return dataₜ
         end

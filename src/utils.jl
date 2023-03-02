@@ -70,13 +70,13 @@ function reset_rnn_state!(rnn)
     nothing
 end
 
-"""reset rnn state for just idx-th index in the batch. idx can also be a bool array marking all the indices for which the rnn sttae needs to be reset."""
-function reset_rnn_state!(m::Flux.Recur, idx::Union{Int, BitVector})
-    if (idx isa BitArray) && all(idx)
-        reset_rnn_state!(m)
+"""reset rnn state for just idx-th index in the batch. idx can also be a bool array marking all the indices for which the rnn state needs to be reset."""
+function reset_rnn_state!(m::Flux.Recur, idx::BitVector)
+    if all(idx)
+        Flux.reset!(m)
         return nothing
     end
-    if (idx isa BitArray) && !any(idx)
+    if !any(idx)
         return nothing
     end
     n = size(m.state)[end]  # batch size
@@ -91,14 +91,32 @@ function reset_rnn_state!(m::Flux.Recur, idx::Union{Int, BitVector})
     m.state = m.state .* (1 .- mask) + m.cell.state0 * mask
     nothing
 end
-function reset_rnn_state!(m, idx::Union{Int, BitVector})
-    if (idx isa BitArray) && all(idx)
-        reset_rnn_state!(m)
+function reset_rnn_state!(m::Flux.Recur, idx::Int)
+    n = size(m.state)[end]  # batch size
+    mask = Flux.Zygote.ignore() do
+        mask = zeros(eltype(m.state), 1, n)
+        mask[1, idx] = 1
+        if m.state isa Flux.CUDA.CuArray
+            mask = gpu(mask)
+        end
+        return mask
+    end
+    m.state = m.state .* (1 .- mask) + m.cell.state0 * mask
+    nothing
+end
+
+function reset_rnn_state!(m, idx::BitVector)
+    if all(idx)
+        Flux.reset!(m)
         return nothing
     end
-    if (idx isa BitArray) && !any(idx)
+    if !any(idx)
         return nothing
     end
+    foreach(_m -> reset_rnn_state!(_m, idx), Flux.functor(m)[1])
+    nothing
+end
+function reset_rnn_state!(m, idx::Int)
     foreach(_m -> reset_rnn_state!(_m, idx), Flux.functor(m)[1])
     nothing
 end
