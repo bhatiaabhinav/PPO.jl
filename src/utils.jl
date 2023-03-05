@@ -47,13 +47,13 @@ get_rnn_state(m::Flux.Recur) = m.state
 get_rnn_state(m) = map(get_rnn_state, Flux.functor(m)[1])
 
 
-function set_rnn_state!(m::Flux.Recur, state)
-    if m.state isa Flux.CUDA.CuArray
-        state = gpu(state)
-    else
-        state = cpu(state)
+function set_rnn_state!(m::Flux.Recur, s)
+    if isa(m.state, Flux.CUDA.CuArray) && !isa(s, Flux.CUDA.CuArray)
+        s = gpu(s)
+    elseif !isa(m.state, Flux.CUDA.CuArray) && isa(s, Flux.CUDA.CuArray)
+        s = cpu(s)
     end
-    m.state = state
+    m.state = s
     nothing
 end
 

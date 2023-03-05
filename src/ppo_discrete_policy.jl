@@ -47,7 +47,10 @@ Flux.gpu(p::RecurrentActor{T}) where {T}  = RecurrentActor{T}(Flux.gpu(p.actor_m
 Flux.cpu(p::RecurrentActor{T}) where {T}  = RecurrentActor{T}(Flux.cpu(p.actor_model), p.deterministic, p.n, p.prev_a, p.prev_r)
 
 function MDPs.preepisode(p::RecurrentActor; kwargs...)
+    fill!(p.prev_a, 0)
+    p.prev_r = 0
     Flux.reset!(p.actor_model)
+    nothing
 end
 
 function (p::RecurrentActor{T})(rng::AbstractRNG, o::Vector{T})::Int where {T}

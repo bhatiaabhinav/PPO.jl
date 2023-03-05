@@ -70,11 +70,11 @@ function postepisode(ppo::PPOLearner; returns, steps, rng, kwargs...)
         𝐯ₜ = init_𝐯ₜ
         data = map(1:M) do t
             𝛑ₜ, log𝛑ₜ = get_probs_logprobs(actor, 𝐬ₜ)   # Forward actor
-            𝐚ₜ = fill(CartesianIndex(0, 0), N)
+            𝐚ₜ = fill(CartesianIndex(0, 0), 1, N)
             Threads.@threads for i in 1:N
                 aᵢₜ = sample(rng, 1:n, ProbabilityWeights(𝛑ₜ[:, i]))
                 step!(envs[i], aᵢₜ; rng=rng)
-                𝐚ₜ[i] = CartesianIndex(aᵢₜ, i)
+                𝐚ₜ[1, i] = CartesianIndex(aᵢₜ, i)
             end
             𝐫ₜ = mapfoldl(reward, hcat, envs) |> tof32
             𝐬ₜ′= mapfoldl(state, hcat, envs) |> tof32
@@ -89,7 +89,7 @@ function postepisode(ppo::PPOLearner; returns, steps, rng, kwargs...)
             𝐯ₜ′ = critic(𝐬ₜ′)
             𝛅ₜ = 𝐫ₜ + γ * (1f0 .- 𝐝ₜ) .* 𝐯ₜ′ - 𝐯ₜ
             dataₜ = (𝐬ₜ, 𝐚ₜ, 𝐫ₜ, 𝐝ₜ, 𝐭ₜ, 𝐬ₜ′, 𝛅ₜ, 𝛑ₜ, log𝛑ₜ, 𝐯ₜ)
-            # ---------------- prepare of next step -------------------
+            # ---------------- prepare for next step -------------------
             # set up states:
             𝐬ₜ = copy(𝐬ₜ′)
             any_reset = false
@@ -112,7 +112,6 @@ function postepisode(ppo::PPOLearner; returns, steps, rng, kwargs...)
             return dataₜ
         end
         ppo.𝐬ₜ = 𝐬ₜ
-        ppo.𝐡ₜ = get_rnn_state.((actor, critic))
         ppo.𝐯ₜ = 𝐯ₜ
         return data
     end
@@ -132,7 +131,7 @@ function postepisode(ppo::PPOLearner; returns, steps, rng, kwargs...)
         ℓ, v̄, H̄, kl = 0, 0, 0, 0
         isrecurrent && set_rnn_state!.((actor, critic), init_𝐡ₜ)
         θ = Flux.params(actor, critic)
-        batch_size = clamp(N, ppo.batch_size, N*M)
+        batch_size = clamp(ppo.batch_size, N, N*M)
         batch_nsteps = batch_size ÷ N
         if !isrecurrent; data = shuffle(rng, data); end
         foreach(splitequal(M, batch_nsteps)) do timeindices
@@ -194,13 +193,17 @@ function postepisode(ppo::PPOLearner; returns, steps, rng, kwargs...)
     update_advantates!(data)
     if ppo.device == gpu; data = device(map(dataₜ -> ppo.device.(dataₜ), data)); end;
 
-    Flux.loadparams!(ppo.actor_gpu.actor_model, Flux.params(ppo.actor.actor_model))
+    Flux.loadparams!(ppo.actor_gpu, Flux.params(ppo.actor))
     Flux.loadparams!(ppo.critic_gpu, Flux.params(ppo.critic))
 
     ℓ, v̄, H̄, kl, num_epochs = update_actor_critic_with_early_stopping!(ppo.actor_gpu, ppo.critic_gpu, data, nepochs)
 
-    Flux.loadparams!(ppo.actor.actor_model, Flux.params(ppo.actor_gpu.actor_model))
+    Flux.loadparams!(ppo.actor, Flux.params(ppo.actor_gpu))
     Flux.loadparams!(ppo.critic, Flux.params(ppo.critic_gpu))
+    if isrecurrent
+        set_rnn_state!.((ppo.actor, ppo.critic), get_rnn_state.((ppo.actor_gpu, ppo.critic_gpu)))
+        ppo.𝐡ₜ = get_rnn_state.((ppo.actor, ppo.critic))
+    end
 
     ppo.stats[:ℓ] = ℓ
     ppo.stats[:H̄] = H̄
