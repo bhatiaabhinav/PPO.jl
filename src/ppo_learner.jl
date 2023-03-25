@@ -18,6 +18,8 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
     nepochs::Int = 10           # number of epochs per iteration.
     minibatch_size::Int = 512
     entropy_bonus::Float32 = 0.01f0 # coefficient of the entropy term in the overall PPO loss, to encourage exploration.
+    center_advantages::Bool = true # whether to center advantages to have zero mean.
+    scale_advantages::Bool = true  # whether to scale advantages to have unit variance.
     clipnorm::Float32 = Inf     # clip gradients by norm
     adam_weight_decay::Float32 = 0f0      # adam weight decay
     adam_epsilon::Float32 = 1f-7    # adam epsilon
@@ -141,16 +143,22 @@ function postepisode(ppo::PPOLearner; returns, steps, rng, kwargs...)
     end
 
     function ppo_loss(actor, critic, 𝐬, 𝐚, 𝛅, old𝛑, 𝐯)
+        # ---- critic loss ----
+        critic_loss = Flux.mse(critic(𝐬), 𝐯 + 𝛅)
+        # ---- actor loss ----
         𝐚 = Zygote.@ignore CartesianIndex.(zip(𝐚, (1:size(𝐯, 2))'))
         𝛑, log𝛑 = get_probs_logprobs(actor, 𝐬)
+        𝛅 = !ppo.center_advantages ? 𝛅 : Zygote.@ignore 𝛅 .- mean(𝛅) 
+        𝛅 = !ppo.scale_advantages ? 𝛅 : Zygote.@ignore 𝛅 ./ (std(𝛅) + 1e-8)
         if ppo.ppo
             𝑟 =  𝛑[𝐚] ./ old𝛑[𝐚]
             actor_loss = -min.(𝑟 .* 𝛅, clamp.(𝑟, 1-ϵ, 1+ϵ) .* 𝛅) |> mean
         else
             actor_loss = -𝛅 .* log𝛑[𝐚] |> mean
         end
-        critic_loss = Flux.mse(critic(𝐬), 𝐯 + 𝛅)
+        # ---- entropy bonus ----
         entropy = -sum(𝛑 .* log𝛑; dims=1) |> mean
+        # ---- total loss ----
         return actor_loss + critic_loss - entropy_bonus * entropy
     end
 
