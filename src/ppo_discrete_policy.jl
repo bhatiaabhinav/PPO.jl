@@ -3,7 +3,7 @@ using StatsBase
 using Flux
 using Random
 
-export Actor, RecurrentActor
+export Actor, RecurrentActor, TransformerActor
 
 struct Actor{T<:AbstractFloat} <: AbstractPolicy{Vector{T}, Int}
     actor_model  # maps states to action log probabilities
@@ -70,7 +70,7 @@ function MDPs.poststep(p::RecurrentActor{T}; env, kwargs...) where {T}
     p.prev_r = reward(env)
     # @debug "Storing action, reward in policy struct"
     nothing
-end
+end 
 
 
 
@@ -81,7 +81,7 @@ function (p::SomeActor{T})(rng::AbstractRNG, 𝐬::AbstractMatrix{<:AbstractFloa
     𝐬 = tof32(𝐬)
     probabilities = p(𝐬, :)
     n, batch_size = size(probabilities)
-    π = zeros(Int, n)
+    π = zeros(Int, batch_size)
     for i in 1:batch_size
         π[i] = sample(rng, 1:n, ProbabilityWeights(probabilities[:, i]))
     end
@@ -118,3 +118,116 @@ function get_probs_logprobs(p::SomeActor{T}, 𝐬::AbstractMatrix{<:AbstractFloa
 end
 
 
+
+mutable struct TransformerActor{T <: AbstractFloat} <: AbstractPolicy{Vector{T}, Int}
+    transformer
+    deterministic::Bool
+    n::Int
+    prev_a::Vector{Float32}
+    prev_r::Float32
+    prev_d::Float32
+    evidence_seq
+end
+function TransformerActor{T}(transformer, deterministic, n::Int) where {T}
+    TransformerActor{T}(transformer, deterministic, n, zeros(Float32, n), 0f0, 1f0 ,nothing)
+end
+
+Flux.@functor TransformerActor (transformer, )
+Flux.gpu(p::TransformerActor{T}) where {T}  = TransformerActor{T}(Flux.gpu(p.transformer), p.deterministic, p.n, p.prev_a, p.prev_r, p.prev_d, p.evidence_seq)
+Flux.cpu(p::TransformerActor{T}) where {T}  = TransformerActor{T}(Flux.cpu(p.transformer), p.deterministic, p.n, p.prev_a, p.prev_r, p.prev_d, p.evidence_seq)
+
+function MDPs.preepisode(p::TransformerActor; kwargs...)
+    fill!(p.prev_a, 0)
+    p.prev_r = 0
+    p.prev_d = 1
+    p.evidence_seq = nothing
+    nothing
+end
+
+function (p::TransformerActor{T})(rng::AbstractRNG, o::Vector{T})::Int where {T}
+    # println("o: ", o)
+    # println("p.prev_a: ", p.prev_a)
+    # println("p.prev_r: ", p.prev_r)
+    # println("p.isnew: ", p.isnew)
+    𝐬 = reshape(vcat(p.prev_a, p.prev_r, p.prev_d,  tof32(o)), :, 1)
+    if p.evidence_seq === nothing
+        evidence_seq = 𝐬
+    else
+        evidence_seq = hcat(p.evidence_seq, 𝐬)
+    end
+    evidence_seq_batched = reshape(evidence_seq, size(evidence_seq)..., 1)
+    𝐚 = p(rng, evidence_seq_batched) # returns an action for each timestep for each batch
+    return 𝐚[end, 1]
+end
+
+function (p::TransformerActor{T})(o::Vector{T}, a::Int) where {T}
+    𝐬 = reshape(vcat(p.prev_a, p.prev_r, p.prev_d, tof32(o)), :, 1)
+    if p.evidence_seq === nothing
+        evidence_seq = 𝐬
+    else
+        evidence_seq = hcat(p.evidence_seq, 𝐬)
+    end
+    evidence_seq_batched = reshape(evidence_seq, size(evidence_seq)..., 1)
+    return p(evidence_seq_batched, :)[a, end, 1]
+end
+
+function MDPs.poststep(p::TransformerActor{T}; env, kwargs...) where {T}
+    o::Vector{T} = state(env)
+    𝐬 = reshape(vcat(p.prev_a, p.prev_r, p.prev_d, tof32(o)), :, 1)
+    if p.evidence_seq === nothing
+        p.evidence_seq = 𝐬
+    else
+        p.evidence_seq = hcat(p.evidence_seq, 𝐬)
+    end
+    fill!(p.prev_a, 0f0)
+    p.prev_a[action(env)] = 1f0
+    p.prev_r = reward(env)
+    p.prev_d = in_absorbing_state(env) |> Float32
+    # @debug "Storing action, reward in policy struct"
+    nothing
+end
+
+function (p::TransformerActor{T})(rng::AbstractRNG, evidence_seq::AbstractArray{<:AbstractFloat, 3})::Matrix{Int} where {T}
+    evidence_seq = tof32(evidence_seq)
+    probabilities = p(evidence_seq, :)  # returns a probability for each action for each timestep for each batch. (n_actions, n_timesteps, n_batches)
+    n, seq_len, batch_size = size(probabilities)
+    π = zeros(Int, seq_len, batch_size)
+    for i in 1:batch_size
+        for j in 1:seq_len
+            π[j, i] = sample(rng, 1:n, ProbabilityWeights(probabilities[:, j, i]))
+        end
+    end
+    return π
+end
+
+
+function (p::TransformerActor{T})(evidence_seq::AbstractArray{<:AbstractFloat, 3}, 𝐚::AbstractMatrix{Int})::AbstractMatrix{Float32} where {T}
+    evidence_seq = tof32(evidence_seq)
+    probabilities = p(evidence_seq, :) # returns a probability for each action for each timestep for each batch. (n_actions, n_timesteps, n_batches)
+    seq_len, batch_size = size(𝐚)
+    action_indices = [CartesianIndex(𝐚[j, i], j, i) for j in 1:seq_len, i in 1:batch_size]
+    return probabilities[action_indices]
+end
+
+
+function (p::TransformerActor{T})(evidence_seq::AbstractArray{<:AbstractFloat, 3}, ::Colon)::AbstractArray{Float32, 3} where {T}
+    evidence_seq = tof32(evidence_seq)
+    logits = p.transformer(evidence_seq) # returns logits for each action for each timestep for each batch. (n_actions, n_timesteps, n_batches)
+    if p.deterministic
+        logits = logits * 1.0f6
+    end
+    probabilities = Flux.softmax(logits)
+    return probabilities
+end
+
+
+function get_probs_logprobs(p::TransformerActor{T}, evidence_seq::AbstractArray{<:AbstractFloat, 3})::Tuple{AbstractArray{Float32, 3}, AbstractArray{Float32, 3}} where {T}
+    evidence_seq = tof32(evidence_seq)
+    logits = p.transformer(evidence_seq) # returns logits for each action for each timestep for each batch. (n_actions, n_timesteps, n_batches)
+    if p.deterministic
+        logits = logits * 1.0f6
+    end
+    probabilities = Flux.softmax(logits)
+    logprobabilities = Flux.logsoftmax(logits)
+    return probabilities, logprobabilities
+end

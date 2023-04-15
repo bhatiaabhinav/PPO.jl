@@ -125,7 +125,7 @@ function postepisode(ppo::PPOLearner; returns, steps, rng, kwargs...)
         𝐀ₜ′ = 0
         for dataₜ in reverse(data)
             (𝐬ₜ, 𝐚ₜ, 𝐫ₜ, 𝐝ₜ, 𝐭ₜ, 𝐬ₜ′, 𝛅ₜ, 𝛑ₜ, log𝛑ₜ, 𝐯ₜ) = dataₜ
-            𝛅ₜ .+= γ * λ * (1f0 .- 𝐝ₜ) .* 𝐀ₜ′
+            𝛅ₜ .+= γ * λ * (1f0 .- 𝐝ₜ) .* (1f0 .- 𝐭ₜ) .* 𝐀ₜ′
             𝐀ₜ′ = 𝛅ₜ
         end
     end
@@ -168,6 +168,8 @@ function postepisode(ppo::PPOLearner; returns, steps, rng, kwargs...)
         𝐬, 𝐚, 𝐝, 𝐭, 𝛅, old𝛑, 𝐯 = map(𝐱 -> reshape(𝐱, :, N, M), (𝐬, 𝐚, 𝐝, 𝐭, 𝛅, old𝛑, 𝐯))    # reshape to 3D to make time as last axis.
         nsgdsteps = ceil(Int, B / b)
         _N = ceil(Int, N / nsgdsteps) # num envs per minibatch
+        # println("nsgdsteps: ", nsgdsteps)
+        # println("num envs per minibatch: ", _N)
         progress = Progress(N; desc="Performing gradient updates", color=:blue, enabled=progressmeter)
         for env_indices in splitequal(N, _N)
             _𝐬, _𝐚, _𝐝, _𝐭, _𝛅, _old𝛑, _𝐯 = map(𝐱 -> 𝐱[:, env_indices, :], (𝐬, 𝐚, 𝐝, 𝐭, 𝛅, old𝛑, 𝐯))
@@ -209,31 +211,6 @@ function postepisode(ppo::PPOLearner; returns, steps, rng, kwargs...)
         finish!(progress)
         return loss
     end
-
-    # function update_actor_critic_one_epoch_recurrent_truncated_bptt!(actor, critic, data)
-    #     loss = 0
-    #     𝐬, 𝐚, _, 𝐝, 𝐭, _, 𝛅, old𝛑, _, 𝐯 = data
-    #     𝐬, 𝐚, 𝐝, 𝐭, 𝛅, old𝛑, 𝐯 = @views map(𝐱 -> reshape(𝐱, :, N, M), (𝐬, 𝐚, 𝐝, 𝐭, 𝛅, old𝛑, 𝐯))    # reshape to 3D to make time as last axis.
-    #     set_rnn_state!.((actor, critic), init_𝐡ₜ)
-    #     θ = Flux.params(actor, critic)
-    #     _M = ceil(Int, b/N)
-    #     foreach(splitequal(M, _M)) do timeindices
-    #         _loss, ∇ = withgradient(θ) do
-    #             return mapfoldl(+, timeindices) do t
-    #                 (𝐬ₜ, 𝐚ₜ, 𝐝ₜ, 𝐭ₜ, 𝛅ₜ, old𝛑ₜ, 𝐯ₜ) = Zygote.@ignore @views map(𝐱 -> 𝐱[:, :, t], (𝐬, 𝐚, 𝐝, 𝐭, 𝛅, old𝛑, 𝐯))
-    #                 lossₜ = ppo_loss(actor, critic, 𝐬ₜ, 𝐚ₜ, 𝛅ₜ, old𝛑ₜ, 𝐯ₜ)
-    #                 if isrecurrent
-    #                     reset_idxs::BitVector = Zygote.@ignore (cpu(𝐝ₜ + 𝐭ₜ) .> 0)[1, :]
-    #                     reset_rnn_state!.((actor, critic), (reset_idxs, reset_idxs));
-    #                 end
-    #                 return lossₜ / M
-    #             end
-    #         end
-    #         loss += _loss
-    #         Flux.update!(ppo.optim, θ, ∇)
-    #     end
-    #     return loss
-    # end
 
     function calculate_stats(actor, critic, data)
         H̄, v̄, kl = 0, 0, 0
