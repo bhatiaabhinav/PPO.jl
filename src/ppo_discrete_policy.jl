@@ -136,24 +136,21 @@ Flux.@functor TransformerActor (transformer, )
 Flux.gpu(p::TransformerActor{T}) where {T}  = TransformerActor{T}(Flux.gpu(p.transformer), p.deterministic, p.n, p.prev_a, p.prev_r, p.prev_d, p.evidence_seq)
 Flux.cpu(p::TransformerActor{T}) where {T}  = TransformerActor{T}(Flux.cpu(p.transformer), p.deterministic, p.n, p.prev_a, p.prev_r, p.prev_d, p.evidence_seq)
 
-function MDPs.preepisode(p::TransformerActor; kwargs...)
+function MDPs.preepisode(p::TransformerActor{T}; env, kwargs...) where {T}
     fill!(p.prev_a, 0)
     p.prev_r = 0
     p.prev_d = 1
-    p.evidence_seq = nothing
+    o::Vector{T} = state(env)
+    p.evidence_seq = reshape(vcat(p.prev_a, p.prev_r, p.prev_d, tof32(o)), :, 1)
     nothing
 end
 
 function (p::TransformerActor{T})(rng::AbstractRNG, o::Vector{T})::Int where {T}
-    # println("o: ", o)
-    # println("p.prev_a: ", p.prev_a)
-    # println("p.prev_r: ", p.prev_r)
-    # println("p.isnew: ", p.isnew)
     𝐬 = reshape(vcat(p.prev_a, p.prev_r, p.prev_d,  tof32(o)), :, 1)
     if p.evidence_seq === nothing
         evidence_seq = 𝐬
     else
-        evidence_seq = hcat(p.evidence_seq, 𝐬)
+        evidence_seq = @views hcat(p.evidence_seq[:, 1:end-1], 𝐬)
     end
     evidence_seq_batched = reshape(evidence_seq, size(evidence_seq)..., 1)
     𝐚 = p(rng, evidence_seq_batched) # returns an action for each timestep for each batch
@@ -165,25 +162,20 @@ function (p::TransformerActor{T})(o::Vector{T}, a::Int) where {T}
     if p.evidence_seq === nothing
         evidence_seq = 𝐬
     else
-        evidence_seq = hcat(p.evidence_seq, 𝐬)
+        evidence_seq = @views hcat(p.evidence_seq[:, end-1], 𝐬)
     end
     evidence_seq_batched = reshape(evidence_seq, size(evidence_seq)..., 1)
     return p(evidence_seq_batched, :)[a, end, 1]
 end
 
 function MDPs.poststep(p::TransformerActor{T}; env, kwargs...) where {T}
-    o::Vector{T} = state(env)
-    𝐬 = reshape(vcat(p.prev_a, p.prev_r, p.prev_d, tof32(o)), :, 1)
-    if p.evidence_seq === nothing
-        p.evidence_seq = 𝐬
-    else
-        p.evidence_seq = hcat(p.evidence_seq, 𝐬)
-    end
     fill!(p.prev_a, 0f0)
     p.prev_a[action(env)] = 1f0
     p.prev_r = reward(env)
     p.prev_d = in_absorbing_state(env) |> Float32
-    # @debug "Storing action, reward in policy struct"
+    o::Vector{T} = state(env)
+    𝐬 = reshape(vcat(p.prev_a, p.prev_r, p.prev_d, tof32(o)), :, 1)
+    p.evidence_seq = hcat(p.evidence_seq, 𝐬)
     nothing
 end
 
