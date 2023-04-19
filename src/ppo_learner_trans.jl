@@ -28,12 +28,14 @@ Base.@kwdef mutable struct PPOTransformerLearner <: AbstractHook
     λ = 0.95f0                  # Used to calulate TD(λ) advantages using Generalized Advantage Estimation (GAE) method.
     ϵ = 0.2f0                   # epsilon used in PPO clip objective
     kl_target = 0.01            # In each iteration, early stop training if KL divergence from old policy exceeds this value.
+    critic_early_stop::Bool = false  # whether to early stop training critic if KL divergence from old policy exceeds kl_target or train for nepochs.
     ppo = true                  # whether to use PPO clip objective. If false, standard advantange actor-critic (A2C) objective will be used.
     device = cpu                # `cpu` or `gpu`
     progressmeter::Bool = false # Whether to show data and gradient updates progress using a progressmeter
 
     # data structures:
-    optim = make_adam_optim(lr, (0.9, 0.999), adam_epsilon, clipnorm, adam_weight_decay)
+    optim_actor = make_adam_optim(lr, (0.9, 0.999), adam_epsilon, clipnorm, 0)
+    optim_critic = make_adam_optim(lr, (0.9, 0.999), adam_epsilon, clipnorm, adam_weight_decay)  # regularize critic with weight decay (l2 norm) but don't regularize actor
     actor_gpu = device(deepcopy(actor))
     critic_gpu = device(deepcopy(critic))
 
@@ -66,7 +68,7 @@ function postepisode(ppo::PPOTransformerLearner; returns, steps, rng, kwargs...)
         𝐯′ = zeros(Float32, 1, 0, N)        # value of next state.          (1, 0, N) to begin with
         
     
-        progress = Progress(M; color=:blue, desc="Collecting trajectories", enabled=progressmeter)
+        progress = Progress(M; color=:white, desc="Collecting trajectories", enabled=progressmeter)
 
         for t in 1:M
             𝐞ₜ = vcat(𝐚ₜ_prev, 𝐫ₜ_prev, 𝐝ₜ_prev, 𝐬ₜ)                        # (e, N)
@@ -181,6 +183,45 @@ function postepisode(ppo::PPOTransformerLearner; returns, steps, rng, kwargs...)
     end
 
     """
+    `𝐞` is the evidence tensor of shape (e, seq_len, batch_size)
+    `𝐚` is the Int action tensor of shape (1, seq_len, batch_size)
+    `𝛅` is the advantage tensor of shape (1, seq_len, batch_size)
+    `old𝛑` is the old policy tensor of shape (n, seq_len, batch_size)
+    `𝐯` is the value tensor of shape (1, seq_len, batch_size)
+    """
+    function ppo_loss_actor_only(actor, 𝐞, 𝐚, 𝛅, old𝛑, 𝐯)
+        # ---- actor loss ----
+        _, seq_len, batch_size = size(𝐚)
+        𝐚 = Zygote.@ignore [CartesianIndex(𝐚[1, t, i], t, i) for t in 1:seq_len, i in 1:batch_size] # (seq_len, batch_size)
+        𝐚 = reshape(𝐚, 1, seq_len, batch_size)  # (1, seq_len, batch_size)
+        𝛑, log𝛑 = get_probs_logprobs(actor, 𝐞) # (n, seq_len, batch_size)
+        𝛅 = !ppo.center_advantages ? 𝛅 : Zygote.@ignore 𝛅 .- mean(𝛅) # (1, seq_len, batch_size)
+        𝛅 = !ppo.scale_advantages ? 𝛅 : Zygote.@ignore 𝛅 ./ (std(𝛅) + 1e-8) # (1, seq_len, batch_size)
+        if ppo.ppo
+            𝑟 =  𝛑[𝐚] ./ old𝛑[𝐚] # (1, seq_len, batch_size)
+            actor_loss = -min.(𝑟 .* 𝛅, clamp.(𝑟, 1-ϵ, 1+ϵ) .* 𝛅) |> mean
+        else
+            actor_loss = -𝛅 .* log𝛑[𝐚] |> mean
+        end
+        # ---- entropy bonus ----
+        entropy = -sum(𝛑 .* log𝛑; dims=1) |> mean
+        return actor_loss - entropy_bonus * entropy, actor_loss
+    end
+
+    """
+    `𝐞` is the evidence tensor of shape (e, seq_len, batch_size)
+    `𝐚` is the Int action tensor of shape (1, seq_len, batch_size)
+    `𝛅` is the advantage tensor of shape (1, seq_len, batch_size)
+    `old𝛑` is the old policy tensor of shape (n, seq_len, batch_size)
+    `𝐯` is the value tensor of shape (1, seq_len, batch_size)
+    """
+    function ppo_loss_critic_only(critic, 𝐞, 𝐚, 𝛅, old𝛑, 𝐯)
+        # ---- critic loss ----
+        critic_loss = Flux.mse(critic(𝐞), 𝐯 + 𝛅)
+        return critic_loss, critic_loss
+    end
+
+    """
     `𝐞` is the evidence tensor of shape (e, M, N)
     `𝐚` is the Int action tensor of shape (1, M, N)
     `𝛅` is the advantage tensor of shape (1, M, N)
@@ -188,10 +229,10 @@ function postepisode(ppo::PPOTransformerLearner; returns, steps, rng, kwargs...)
     `𝐯` is the value tensor of shape (1, M, N)
     """
     function update_actor_critic_one_epoch!(actor, critic, 𝐞, 𝐚, 𝛅, old𝛑, 𝐯)
-        loss, actor_loss, critic_loss, θ = 0f0, 0f0, 0f0, Flux.params(actor, critic)
+        loss, actor_loss, critic_loss, θ_actor, θ_critic, θ = 0f0, 0f0, 0f0, Flux.params(actor), Flux.params(critic), Flux.params(actor, critic)
         nsgdsteps = ceil(Int, N / ppo.minibatch_size)
         _N = ceil(Int, N / nsgdsteps) # num envs per minibatch
-        progress = Progress(N; desc="Performing gradient updates", color=:blue, enabled=progressmeter)
+        progress = Progress(N; desc="Performing actor critic updates", color=:magenta, enabled=progressmeter)
         for env_indices in splitequal(N, _N)
             _𝐞, _𝐚, _𝛅, _old𝛑, _𝐯 = @views map(𝐱 -> 𝐱[:, :, env_indices], (𝐞, 𝐚, 𝛅, old𝛑, 𝐯)) # (e, M, _N)
             _loss, _∇ =  withgradient(θ) do
@@ -201,12 +242,69 @@ function postepisode(ppo::PPOTransformerLearner; returns, steps, rng, kwargs...)
                 loss += _l * length(env_indices) / N
                 return _l
             end
-            Flux.update!(ppo.optim, θ, _∇)
+            Flux.update!(ppo.optim_actor, θ_actor, _∇)
+            Flux.update!(ppo.optim_critic, θ_critic, _∇)
             next!(progress; step=length(env_indices))
         end
         finish!(progress)
         return loss, actor_loss, critic_loss
     end
+
+    """
+    `𝐞` is the evidence tensor of shape (e, M, N)
+    `𝐚` is the Int action tensor of shape (1, M, N)
+    `𝛅` is the advantage tensor of shape (1, M, N)
+    `old𝛑` is the old policy tensor of shape (n, M, N)
+    `𝐯` is the value tensor of shape (1, M, N)
+    """
+    function update_actor_only_one_epoch!(actor, 𝐞, 𝐚, 𝛅, old𝛑, 𝐯)
+        loss, actor_loss, θ = 0f0, 0f0, Flux.params(actor)
+        nsgdsteps = ceil(Int, N / ppo.minibatch_size)
+        _N = ceil(Int, N / nsgdsteps) # num envs per minibatch
+        progress = Progress(N; desc="Performing actor updates", color=:blue, enabled=progressmeter)
+        for env_indices in splitequal(N, _N)
+            _𝐞, _𝐚, _𝛅, _old𝛑, _𝐯 = @views map(𝐱 -> 𝐱[:, :, env_indices], (𝐞, 𝐚, 𝛅, old𝛑, 𝐯)) # (e, M, _N)
+            _loss, _∇ =  withgradient(θ) do
+                _l, _al = ppo_loss_actor_only(actor, _𝐞, _𝐚, _𝛅, _old𝛑, _𝐯)
+                actor_loss += _al * length(env_indices) / N
+                loss += _l * length(env_indices) / N
+                return _l
+            end
+            Flux.update!(ppo.optim_actor, θ, _∇)
+            next!(progress; step=length(env_indices))
+        end
+        finish!(progress)
+        return loss, actor_loss
+    end
+
+    """
+    `𝐞` is the evidence tensor of shape (e, M, N)
+    `𝐚` is the Int action tensor of shape (1, M, N)
+    `𝛅` is the advantage tensor of shape (1, M, N)
+    `old𝛑` is the old policy tensor of shape (n, M, N)
+    `𝐯` is the value tensor of shape (1, M, N)
+    """
+    function update_critic_only_one_epoch!(critic, 𝐞, 𝐚, 𝛅, old𝛑, 𝐯)
+        loss, critic_loss, θ = 0f0, 0f0, Flux.params(critic)
+        nsgdsteps = ceil(Int, N / ppo.minibatch_size)
+        _N = ceil(Int, N / nsgdsteps) # num envs per minibatch
+        progress = Progress(N; desc="Performing critic updates", color=:red, enabled=progressmeter)
+        for env_indices in splitequal(N, _N)
+            _𝐞, _𝐚, _𝛅, _old𝛑, _𝐯 = @views map(𝐱 -> 𝐱[:, :, env_indices], (𝐞, 𝐚, 𝛅, old𝛑, 𝐯)) # (e, M, _N)
+            _loss, _∇ =  withgradient(θ) do
+                _l, _cl = ppo_loss_critic_only(critic, _𝐞, _𝐚, _𝛅, _old𝛑, _𝐯)
+                critic_loss += _cl * length(env_indices) / N
+                loss += _l * length(env_indices) / N
+                return _l
+            end
+            Flux.update!(ppo.optim_critic, θ, _∇)
+            next!(progress; step=length(env_indices))
+        end
+        finish!(progress)
+        return critic_loss
+    end
+
+    
 
     """
     `𝐞` is the evidence tensor of shape (e, M, N)
@@ -219,26 +317,49 @@ function postepisode(ppo::PPOTransformerLearner; returns, steps, rng, kwargs...)
         H̄ = -sum(𝛑 .* log𝛑; dims=1) |> mean
         kl = sum(old𝛑 .* (oldlog𝛑 .- log𝛑); dims=1) |> mean
         v̄ = critic(𝐞) |> mean
-        return kl, H̄, v̄
+        v̄₁ = @views sum(critic(𝐞)[1, 1, :]) / N
+        return kl, H̄, v̄, v̄₁
     end
 
     function update_actor_critic_with_early_stopping!(actor, critic, epochs, 𝐞, 𝐚, 𝛅, old𝛑, oldlog𝛑, 𝐯)
-        ℓ, actor_loss, critic_loss, kl, H̄, v̄ = 0, 0, 0, 0, 0, 0
+        ℓ, actor_loss, critic_loss, kl, H̄, v̄, v̄₁ = 0, 0, 0, 0, 0, 0, 0
         num_epochs = 0
         for epoch in 1:epochs
             ℓ, actor_loss, critic_loss  = update_actor_critic_one_epoch!(actor, critic, 𝐞, 𝐚, 𝛅, old𝛑, 𝐯)
             num_epochs += 1
-            kl, H̄, v̄ = calculate_stats(actor, critic, 𝐞, old𝛑, oldlog𝛑)
+            kl, H̄, v̄, v̄₁ = calculate_stats(actor, critic, 𝐞, old𝛑, oldlog𝛑)
             kl >= kl_target && break
         end
-        return ℓ, actor_loss, critic_loss, kl, H̄, v̄, num_epochs
+        return ℓ, actor_loss, critic_loss, kl, H̄, v̄, v̄₁, num_epochs
+    end
+
+    function update_actor_with_early_stopping_and_critic_full!(actor, critic, epochs, 𝐞, 𝐚, 𝛅, old𝛑, oldlog𝛑, 𝐯)
+        ℓ, actor_loss_with_ent_bonus, actor_loss, critic_loss, kl, H̄, v̄, v̄₁ = 0, 0, 0, 0, 0, 0, 0, 0
+        num_epochs = 0
+        for epoch in 1:epochs
+            ℓ, actor_loss, critic_loss  = update_actor_critic_one_epoch!(actor, critic, 𝐞, 𝐚, 𝛅, old𝛑, 𝐯)
+            actor_loss_with_ent_bonus = ℓ - critic_loss
+            num_epochs += 1
+            kl, H̄, v̄, v̄₁ = calculate_stats(actor, critic, 𝐞, old𝛑, oldlog𝛑)
+            kl >= kl_target && break
+        end
+        for epoch in (num_epochs + 1):epochs # continue training critic
+            critic_loss = update_critic_only_one_epoch!(critic, 𝐞, 𝐚, 𝛅, old𝛑, 𝐯)
+        end
+        ℓ = actor_loss_with_ent_bonus + critic_loss
+        kl, H̄, v̄, v̄₁ = calculate_stats(actor, critic, 𝐞, old𝛑, oldlog𝛑)
+        return ℓ, actor_loss, critic_loss, kl, H̄, v̄, v̄₁, num_epochs
     end
 
     data_𝐞, data_𝐚, data_𝐫, data_𝐭, data_𝐝, data_𝐯′ = collect_trajectories(ppo.actor_gpu, ppo.critic_gpu)
     data_𝐞, data_𝐫, data_𝐭, data_𝐝, data_𝐯′ = device.((data_𝐞, data_𝐫, data_𝐭, data_𝐝, data_𝐯′))
     data_𝛅, data_𝐯, data_𝛑, data_log𝛑 = get_advantages_value_pi_logpi(ppo.actor_gpu, ppo.critic_gpu, data_𝐞, data_𝐚, data_𝐫, data_𝐭, data_𝐝, data_𝐯′)
 
-    ℓ, actor_loss, critic_loss, kl, H̄, v̄, num_epochs = update_actor_critic_with_early_stopping!(ppo.actor_gpu, ppo.critic_gpu, ppo.nepochs, data_𝐞, data_𝐚, data_𝛅, data_𝛑, data_log𝛑, data_𝐯)
+    if ppo.critic_early_stop
+        ℓ, actor_loss, critic_loss, kl, H̄, v̄, v̄₁, num_epochs = update_actor_critic_with_early_stopping!(ppo.actor_gpu, ppo.critic_gpu, ppo.nepochs, data_𝐞, data_𝐚, data_𝛅, data_𝛑, data_log𝛑, data_𝐯)
+    else
+        ℓ, actor_loss, critic_loss, kl, H̄, v̄, v̄₁, num_epochs = update_actor_with_early_stopping_and_critic_full!(ppo.actor_gpu, ppo.critic_gpu, ppo.nepochs, data_𝐞, data_𝐚, data_𝛅, data_𝛑, data_log𝛑, data_𝐯)
+    end
     
     Flux.loadparams!(ppo.actor, Flux.params(ppo.actor_gpu))
     Flux.loadparams!(ppo.critic, Flux.params(ppo.critic_gpu))
@@ -249,6 +370,7 @@ function postepisode(ppo::PPOTransformerLearner; returns, steps, rng, kwargs...)
     ppo.stats[:H̄] = H̄
     ppo.stats[:kl] = kl
     ppo.stats[:v̄] = v̄
+    ppo.stats[:v̄₁] = v̄₁
     ppo.stats[:num_epochs] = num_epochs
 
     @debug "learning stats" steps episodes stats...
