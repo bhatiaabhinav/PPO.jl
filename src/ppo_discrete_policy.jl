@@ -117,7 +117,33 @@ function get_probs_logprobs(p::SomeActor{T}, 𝐬::AbstractMatrix{<:AbstractFloa
     return probabilities, logprobabilities
 end
 
+FC = 1000
+CL = 500
+TH = 10
 
+function decide_context_length(sl)
+    _CL = CL
+    # if sl > FC ÷ 2
+    #     # println("here")
+    #     _CL = sl - FC÷2
+    #     # println(_CL)
+    # else
+    #     _CL = CL
+    # end
+    # if sl >= FC - CL/2
+    #     # println("here")
+    #     _CL = sl - (FC-CL)
+    #     # println(_CL)
+    # else
+    #     _CL = CL ÷ 2
+    # end
+    # _CL = ceil(CL * sl / FC) |> Int
+    # _CL = CL ÷ 2
+    if _CL % TH != 0
+        _CL = _CL + TH - _CL % TH # so that _CL is divisible by TH
+    end
+    return _CL
+end
 
 mutable struct TransformerActor{T <: AbstractFloat} <: AbstractPolicy{Vector{T}, Int}
     transformer
@@ -152,6 +178,25 @@ function (p::TransformerActor{T})(rng::AbstractRNG, o::Vector{T})::Int where {T}
     else
         evidence_seq = @views hcat(p.evidence_seq[:, 1:end-1], 𝐬)
     end
+    sl = size(evidence_seq, 2)
+    _CL = decide_context_length(sl)
+    if sl > _CL
+        # cl = CL
+        if sl % TH == 0
+            cl = _CL
+        else
+            cl = _CL - TH + sl % TH
+        end
+        start_point = sl - cl + 1
+        ran = start_point:sl
+        # @info "trimming context" sl FC CL TH _CL cl ran
+ 
+        evidence_seq = evidence_seq[:, end-cl+1:end]
+        tstart = evidence_seq[end, 1]
+        evidence_seq[end, :] = evidence_seq[end, :] .- tstart
+        evidence_seq[end, :] = (FC/CL) * evidence_seq[end, :]
+    end
+    # sl % TH == 0 && println("t=$sl ", "tseq=", evidence_seq[end, :])
     evidence_seq_batched = reshape(evidence_seq, size(evidence_seq)..., 1)
     𝐚 = p(rng, evidence_seq_batched) # returns an action for each timestep for each batch
     return 𝐚[end, 1]
@@ -163,6 +208,10 @@ function (p::TransformerActor{T})(o::Vector{T}, a::Int) where {T}
         evidence_seq = 𝐬
     else
         evidence_seq = @views hcat(p.evidence_seq[:, end-1], 𝐬)
+    end
+    if size(evidence_seq, 2) >= CL + TH
+        cl = CL + size(evidence_seq, 2) % TH
+        evidence_seq = evidence_seq[:, end-cl+1:end]
     end
     evidence_seq_batched = reshape(evidence_seq, size(evidence_seq)..., 1)
     return p(evidence_seq_batched, :)[a, end, 1]
@@ -204,7 +253,9 @@ end
 
 function (p::TransformerActor{T})(evidence_seq::AbstractArray{<:AbstractFloat, 3}, ::Colon)::AbstractArray{Float32, 3} where {T}
     evidence_seq = tof32(evidence_seq)
+    # println(typeof(evidence_seq))
     logits = p.transformer(evidence_seq) # returns logits for each action for each timestep for each batch. (n_actions, n_timesteps, n_batches)
+    # logits = cpu(logits)
     if p.deterministic
         logits = logits * 1.0f6
     end
