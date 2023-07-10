@@ -47,6 +47,23 @@ function (p::PPOActorDiscrete{T})(rng::AbstractRNG, 𝐬::AbstractArray{Float32}
     return 𝐚
 end
 
+function (p::PPOActorDiscrete{T})(𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Int})::AbstractArray{Float32} where {T}
+    get_probs_logprobs(p, 𝐬, 𝐚)[1]
+end
+
+function get_probs_logprobs(p::PPOActorDiscrete{T}, 𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Int})::Tuple{AbstractArray{Float32}, AbstractArray{Float32}} where {T}
+    probabilities, logprobabilities = get_probs_logprobs(p, 𝐬)
+    @assert ndims(𝐚) == ndims(probabilities) - 1
+    if ndims(probabilities) == 3
+        seq_len, batch_size = size(𝐚)
+        𝐚 = Flux.Zygote.@ignore [CartesianIndex(𝐚[1, t, i], t, i) for t in 1:seq_len, i in 1:batch_size]
+    else
+        batch_size = length(𝐚)
+        𝐚 = Flux.Zygote.@ignore [CartesianIndex(𝐚[i], i) for i in 1:batch_size]
+    end
+    return probabilities[𝐚], logprobabilities[𝐚]
+end
+
 function get_probs_logprobs(p::PPOActorDiscrete{T}, 𝐬::AbstractArray{Float32})::Tuple{AbstractArray{Float32}, AbstractArray{Float32}} where {T}
     if p.recurtype ∈ (MARKOV, TRANSFORMER) || ndims(𝐬) == 2
         logits = p.actor_model(𝐬)
@@ -129,6 +146,10 @@ Flux.cpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContin
 function (p::PPOActorContinuous{Tₛ, Tₐ})(rng::AbstractRNG, 𝐬::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
     𝐚, log𝛑𝐚 = sample_action_logprobs(p, rng, 𝐬)
     return 𝐚
+end
+
+function (p::PPOActorContinuous{Tₛ, Tₐ})(𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
+    get_logprobs(p, 𝐬, 𝐚)
 end
 
 function sample_action_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, rng::AbstractRNG, 𝐬::AbstractArray{Float32})::Tuple{AbstractArray{Float32}, AbstractArray{Float32}} where {Tₛ, Tₐ}
@@ -216,8 +237,15 @@ end
 function (p::PPOActorDiscrete{Tₛ})(rng::AbstractRNG, s::Vector{Tₛ})::Int where {Tₛ}
     ppo_unified(p, rng, s)
 end
+function (p::PPOActorDiscrete{Tₛ})(s::Vector{Tₛ}, a::Int)::Float64 where {Tₛ}
+    ppo_unified(p, s, a)
+end
+
 function (p::PPOActorContinuous{Tₛ, Tₐ})(rng::AbstractRNG, s::Vector{Tₛ})::Vector{Tₐ} where {Tₛ, Tₐ}
     ppo_unified(p, rng, s)
+end
+function (p::PPOActorContinuous{Tₛ, Tₐ})(s::Vector{Tₛ}, a::Vector{Tₐ})::Float64 where {Tₛ, Tₐ}
+    ppo_unified(p, s, a)
 end
 
 function ppo_unified(p::PPOActor{Tₛ, Tₐ}, rng::AbstractRNG, s::Vector{Tₛ}) where {Tₛ, Tₐ}
@@ -247,5 +275,18 @@ function ppo_unified(p::PPOActor{Tₛ, Tₐ}, rng::AbstractRNG, s::Vector{Tₛ})
         a = unbatch_last(a)
     end
     return a
+end
+
+function ppo_unified(p::PPOActor{Tₛ, Tₐ}, s::Vector{Tₛ}, a::Union{Int, Vector{Tₐ}})::Float64 where {Tₛ, Tₐ}
+    if p.recurtype == TRANSFORMER
+        s = hcat(p.observation_history...)
+    end
+    𝐬 = s |> batch |> tof32
+    𝐚 = a |> batch
+    πa = p(𝐬, 𝐚) |> unbatch
+    if p.recurtype == TRANSFORMER
+        πa = unbatch_last(πa)
+    end
+    return πa
 end
 
