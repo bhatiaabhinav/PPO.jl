@@ -8,8 +8,38 @@ import ProgressMeter: @showprogress, Progress, next!, finish!
 
 export PPOLearner
 
+"""
+    PPOLearner(; envs, actor, critic, γ=0.99, nsteps=100, nepochs=10, trajs_per_minibatch=32, entropy_bonus=0.0, decay_ent_bonus=false, normalize_advantages=true, clipnorm=10.0, adam_weight_decay=0.0, adam_epsilon=1e-7, lr_actor=0.0003, lr_critic=0.0003, decay_lr=false, λ=0.95, ϵ=0.2, kl_target=0.01, ppo=true, early_stop_critic=false, device=cpu, progressmeter=false)
+
+A hook that performs an iteration of Proximal Policy Optimization (PPO) in `postepisode` callback.
+
+# Arguments
+- `envs::Vector{AbstractMDP}`: A vector of environments to collect data from. Multithreading is used to collect data in parallel. Julia should be started with multiple threads to take advantage of this.
+- `actor`: A PPO policy to optimize. Either PPOActorDiscrete or PPOActorContinuous.
+- `critic`: A Flux model with recurrence type same as actor.
+- `γ::Float32=0.99`: Discount factor. Used to calulate TD(λ) advantages.
+- `nsteps::Int=100`: Numer of steps per iteration. So that total data per iteration = nenvs * nsteps. With longer nsteps, TD(λ) returns are computed better.
+- `nepochs::Int=10`: Number of epochs per iteration.
+- `trajs_per_minibatch::Int=32`: Number of trajectories per minibatch
+- `entropy_bonus::Float32=0.0`: Coefficient of the entropy term in the overall PPO loss, to encourage exploration.
+- `decay_ent_bonus::Bool=false`: Whether to decay entropy bonus over time to 0, by the end of training (after `max_trials` iterations).
+- `normalize_advantages::Bool=true`: Whether to center and scale advantages to have zero mean and unit variance
+- `clipnorm::Float32=10.0`: Clip gradients by global norm
+- `adam_weight_decay::Float32=0.0`: Adam weight decay
+- `adam_epsilon::Float32=1e-7`: Adam epsilon
+- `lr_actor::Float32=0.0003`: Adam learning rate for actor
+- `lr_critic::Float32=0.0003`: Adam learning rate for critic
+- `decay_lr::Bool=false`: Whether to decay learning rate over time to 0, by the end of training (after `max_trials` iterations).
+- `λ::Float32=0.95`: Used to calulate TD(λ) advantages using Generalized Advantage Estimation (GAE) method.
+- `ϵ::Float32=0.2`: Epsilon used in PPO clip objective
+- `kl_target=0.01`: In each iteration, early stop actor training if KL divergence from old policy exceeds this value.
+- `ppo=true`: Whether to use PPO clip objective. If false, standard advantange actor-critic (A2C) objective will be used.
+- `early_stop_critic=false`: Whether to early stop training critic (along with actor) if KL divergence from old policy exceeds `kl_target`.
+- `device=cpu`: `cpu` or `gpu`
+- `progressmeter=false`: Whether to show data and gradient updates progress using a progressmeter (useful for debugging).
+"""
 Base.@kwdef mutable struct PPOLearner <: AbstractHook
-    envs::Vector{AbstractMDP}   # A vector of differently seeded environments.
+    envs::Vector{AbstractMDP}   # A vector of environments.
     actor::PPOActor
     critic                      # some model with recurrence type same as actor
     γ::Float32 = 0.99           # discount factor. Used to calulate TD(λ) advantages.
