@@ -93,7 +93,7 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
     losses, actor_losses, critic_losses = [], [], []
     θ = Flux.params(ppo.actor_gpu, ppo.critic_gpu)
     while length(losses) < ppo.nepochs
-        desc = stop_actor_training ? "Train Critic $(length(losses)+1)" : "Train Actor-Critic $(length(losses)+1)"
+        desc = stop_actor_training ? "Train Critic Epoch $(length(losses)+1)" : "Train Actor-Critic Epoch $(length(losses)+1)"
         progress = Progress(length(ppo.envs); desc=desc, color=:magenta, enabled=ppo.progressmeter)
         loss, actor_loss, critic_loss = 0, 0, 0
         for env_indices in Flux.chunk(1:length(ppo.envs), size=ppo.trajs_per_minibatch)
@@ -109,7 +109,6 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
             !stop_actor_training && Flux.update!(ppo.optim_actor, Flux.params(ppo.actor_gpu), ∇)
             Flux.update!(ppo.optim_critic, Flux.params(ppo.critic_gpu), ∇)
             next!(progress; step=length(env_indices))
-            # sleep(0.1)
         end
         finish!(progress)
         push!(losses, loss)
