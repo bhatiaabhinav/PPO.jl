@@ -9,7 +9,7 @@ import ProgressMeter: @showprogress, Progress, next!, finish!
 export PPOLearner
 
 """
-    PPOLearner(; envs, actor, critic, γ=0.99, nsteps=100, nepochs=10, trajs_per_minibatch=32, entropy_bonus=0.0, decay_ent_bonus=false, normalize_advantages=true, clipnorm=10.0, adam_weight_decay=0.0, adam_epsilon=1e-7, lr_actor=0.0003, lr_critic=0.0003, decay_lr=false, λ=0.95, ϵ=0.2, kl_target=0.01, ppo=true, early_stop_critic=false, device=cpu, progressmeter=false)
+    PPOLearner(; envs, actor, critic, γ=0.99, nsteps=100, nepochs=10, trajs_per_minibatch=32, entropy_bonus=0.0, decay_ent_bonus=false, normalize_advantages=true, clipnorm=0.5, adam_weight_decay=0.0, adam_epsilon=1e-7, lr_actor=0.0003, lr_critic=0.0003, decay_lr=false, λ=0.95, ϵ=0.2, kl_target=0.01, ppo=true, early_stop_critic=false, device=cpu, progressmeter=false)
 
 A hook that performs an iteration of Proximal Policy Optimization (PPO) in `postepisode` callback.
 
@@ -24,7 +24,7 @@ A hook that performs an iteration of Proximal Policy Optimization (PPO) in `post
 - `entropy_bonus::Float32=0.0`: Coefficient of the entropy term in the overall PPO loss, to encourage exploration.
 - `decay_ent_bonus::Bool=false`: Whether to decay entropy bonus over time to 0, by the end of training (after `max_trials` iterations).
 - `normalize_advantages::Bool=true`: Whether to center and scale advantages to have zero mean and unit variance
-- `clipnorm::Float32=10.0`: Clip gradients by global norm
+- `clipnorm::Float32=0.5`: Clip gradients by global norm
 - `adam_weight_decay::Float32=0.0`: Adam weight decay
 - `adam_epsilon::Float32=1e-7`: Adam epsilon
 - `lr_actor::Float32=0.0003`: Adam learning rate for actor
@@ -49,7 +49,7 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
     entropy_bonus::Float32 = 0.0f0 # coefficient of the entropy term in the overall PPO loss, to encourage exploration.
     decay_ent_bonus::Bool = false # whether to decay entropy bonus
     normalize_advantages::Bool = true # whether to center and scale advantages to have zero mean and unit variance
-    clipnorm::Float32 = 10.0     # clip gradients by global norm
+    clipnorm::Float32 = 0.5     # clip gradients by global norm
     adam_weight_decay::Float32 = 0f0      # adam weight decay
     adam_epsilon::Float32 = 1f-7    # adam epsilon
     lr_actor::Float32 = 0.0003        # adam learning rate for actor
@@ -204,7 +204,7 @@ function collect_trajectories(ppo::PPOLearner, actor, device, rng)
         end
 
         Threads.@threads for i in 1:N
-            a = isdiscrete ? 𝐚ₜ[1, i] : 𝐚ₜ[:, i]
+            a = isdiscrete ? 𝐚ₜ[1, i] : convert(eltype(action_space(ppo.envs[i])), 𝐚ₜ[:, i])
             step!(ppo.envs[i], a; rng=rng)
         end
         
