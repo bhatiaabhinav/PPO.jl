@@ -255,8 +255,8 @@ end
 Given states 𝐬 and actions 𝐚, returns log probabilities of actions. If input is of shape (state_dims, ntimesteps, batch_size), then outputs are of shape (1, nsteps, batch_size). If input is of shape (state_dims, batch_size), then outputs are of shape (1, batch_size).
 """
 function get_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
-    𝐚 = clamp.(𝐚, -1f0 + 1f-6, 1f0 - 1f-6)
     𝐚_unshifted_unscaled = (𝐚 .- p.shift) ./ p.scale
+    𝐚_unshifted_unscaled = clamp.(𝐚_unshifted_unscaled, -1f0 + 1f-3, 1f0 - 1f-3)    # because atanh(1.0) is infinite
     𝐚_untanhed = atanh.(𝐚_unshifted_unscaled)
 
     if p.recurtype ∈ (MARKOV, TRANSFORMER) || ndims(𝐬) == 2
