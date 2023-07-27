@@ -2,7 +2,7 @@
 
 julia_version = "1.9.1"
 manifest_format = "2.0"
-project_hash = "b94555b58ae16e2458e03b4f10e1b0722a2e8472"
+project_hash = "e7c043fb4120f272798083d17ad3c6bad5675653"
 
 [[deps.ANSIColoredPrinters]]
 git-tree-sha1 = "574baf8110975760d391c710b6341da1afa48d8c"
@@ -863,22 +863,9 @@ version = "0.4.77"
     OnlineStatsBase = "925886fa-5bf2-5e8e-b522-a9147a512338"
     Referenceables = "42d2dcc6-99eb-4e98-b66c-637b7d73030e"
 
-[[deps.Transformers]]
-deps = ["DataStructures", "Flux", "LinearAlgebra"]
-git-tree-sha1 = "368144d08c6debb1caff0958c4deda5bbd881578"
-repo-rev = "main"
-repo-url = "https://github.com/bhatiaabhinav/Transformers.jl"
-uuid = "900cc879-51d9-457a-99d4-f4430d1507c3"
-version = "0.2.1"
-
 [[deps.UUIDs]]
 deps = ["Random", "SHA"]
 uuid = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
-
-[[deps.UnPack]]
-git-tree-sha1 = "387c1f73762231e86e0c9c5443ce3b4a0a9a0c2b"
-uuid = "3a884ed6-31ef-47d7-9d2a-63182c4928ed"
-version = "1.0.2"
 
 [[deps.Unicode]]
 uuid = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"

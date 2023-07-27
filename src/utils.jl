@@ -67,3 +67,12 @@ function make_adam_optim(lr, betas, epsilon, weight_decay)
     push!(optim_chain, Adam(lr, betas, epsilon))
     return Flux.Optimiser(optim_chain...)
 end
+
+
+function cartesian_product(X::AbstractArray{Int}, Y::AbstractArray{Int})
+    return [CartesianIndex(x, y) for x in X, y in Y]
+end
+
+function cartesian_product(Xdims::Int, Ydims::Int)
+    return cartesian_product(1:Xdims, 1:Ydims)
+end

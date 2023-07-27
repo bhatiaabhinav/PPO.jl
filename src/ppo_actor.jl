@@ -39,8 +39,7 @@ Flux.cpu(p::PPOActorDiscrete{T}) where {T}  = PPOActorDiscrete{T}(p.recurtype, F
 """
     (p::PPOActorDiscrete{T})(rng::AbstractRNG, 𝐬::AbstractArray{Float32})::VecOrMat{Int} where {T}
 
-Sample actions from the policy given the states 𝐬. States 𝐬 are assumed to be in the form (state_dim, ntimesteps, batch_size) for recurrent policies and (state_dim, batch_size) for markov policies.
-
+Sample actions from the policy given the states 𝐬. States 𝐬 are assumed to be in the form (state_dim, ntimesteps, batch_size) or (state_dim, batch_size).
 # Returns
 - `𝐚`: the sampled actions as a Vector{Int} for markov policies and a Matrix{Int} for recurrent policies
 """
@@ -67,7 +66,7 @@ end
 """
     (p::PPOActorDiscrete{T})(𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Int})::AbstractArray{Float32} where {T}
 
-Get the probabilities of the actions 𝐚 given the states 𝐬. States 𝐬 are assumed to be in the form (state_dim, ntimesteps, batch_size) or (state_dim, batch_size) (allowed only for markov policies). Actions are accordingly assumed to be in the form (ntimesteps, batch_size) or (batch_size).
+Get the probabilities of the actions 𝐚 given the states 𝐬. States 𝐬 are assumed to be in the form (state_dim, ntimesteps, batch_size) or (state_dim, batch_size). Actions are accordingly assumed to be in the form (ntimesteps, batch_size) or (batch_size).
 
 # Returns
 - `probabilities`: the probabilities of the actions 𝐚 given the states 𝐬. 
@@ -81,7 +80,7 @@ end
 """
     get_probs_logprobs(p::PPOActorDiscrete, 𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Int})::Tuple{AbstractArray{Float32}, AbstractArray{Float32}}
 
-Get the probabilities and log probabilities of the actions 𝐚 given the states 𝐬. States 𝐬 are assumed to be in the form (state_dim, ntimesteps, batch_size) or (state_dim, batch_size) (allowed only for markov policies). Actions are accordingly assumed to be in the form (ntimesteps, batch_size) or (batch_size).
+Get the probabilities and log probabilities of the actions 𝐚 given the states 𝐬. States 𝐬 are assumed to be in the form (state_dim, ntimesteps, batch_size) or (state_dim, batch_size). Actions are accordingly assumed to be in the form (ntimesteps, batch_size) or (batch_size).
 
 # Returns
 - `probabilities`: the probabilities of the actions 𝐚 given the states 𝐬.
@@ -105,7 +104,7 @@ end
 """
     get_probs_logprobs(p::PPOActorDiscrete, 𝐬::AbstractArray{Float32})::Tuple{AbstractArray{Float32}, AbstractArray{Float32}}
 
-Get the probabilities and log probabilities of all actions given the states 𝐬. States 𝐬 are assumed to be in the form (state_dim, ntimesteps, batch_size) or (state_dim, batch_size) (allowed only for markov policies).
+Get the probabilities and log probabilities of all actions given the states 𝐬. States 𝐬 are assumed to be in the form (state_dim, ntimesteps, batch_size) or (state_dim, batch_size).
 
 # Returns
 - `probabilities`: the probabilities of all actions given the states 𝐬.
@@ -162,9 +161,15 @@ end
 
 
 function get_loss_and_entropy(p::PPOActorDiscrete, 𝐬, 𝐚, 𝛅, old𝛑, oldlog𝛑, ϵ, use_clip_objective=true)
-    _, seq_len, batch_size = size(𝐚)
-    𝐚 = Flux.Zygote.@ignore [CartesianIndex(𝐚[1, t, i], t, i) for t in 1:seq_len, i in 1:batch_size]
-    𝐚 = reshape(𝐚, 1, seq_len, batch_size)
+    if ndims(𝐬) == 3
+        _, seq_len, batch_size = size(𝐚)
+        𝐚 = Flux.Zygote.@ignore [CartesianIndex(𝐚[1, t, i], t, i) for t in 1:seq_len, i in 1:batch_size]
+        𝐚 = reshape(𝐚, 1, seq_len, batch_size)
+    else
+        _, batch_size = size(𝐚)
+        𝐚 = Flux.Zygote.@ignore [CartesianIndex(𝐚[1, i], i) for i in 1:batch_size]
+        𝐚 = reshape(𝐚, 1, batch_size)
+    end
     𝛑, log𝛑 = get_probs_logprobs(p, 𝐬)
     if use_clip_objective
         𝑟 =  𝛑[𝐚] ./ old𝛑[𝐚]
@@ -255,9 +260,12 @@ end
 Given states 𝐬 and actions 𝐚, returns log probabilities of actions. If input is of shape (state_dims, ntimesteps, batch_size), then outputs are of shape (1, nsteps, batch_size). If input is of shape (state_dims, batch_size), then outputs are of shape (1, batch_size).
 """
 function get_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
+    @assert all(isfinite.(𝐚))
     𝐚_unshifted_unscaled = (𝐚 .- p.shift) ./ p.scale
     𝐚_unshifted_unscaled = clamp.(𝐚_unshifted_unscaled, -1f0 + 1f-3, 1f0 - 1f-3)    # because atanh(1.0) is infinite
+    @assert all(isfinite.(𝐚_unshifted_unscaled))
     𝐚_untanhed = atanh.(𝐚_unshifted_unscaled)
+    @assert all(isfinite.(𝐚_untanhed))
 
     if p.recurtype ∈ (MARKOV, TRANSFORMER) || ndims(𝐬) == 2
         𝛍 = p.actor_model(𝐬)
@@ -265,10 +273,9 @@ function get_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Flo
         # interpret as (state_dim, ntimesteps, batch_size)
         Flux.Zygote.@ignore Flux.reset!(p.actor_model)
         𝛍 = mapfoldl(hcat, 1:size(𝐬, 2)) do t
-            reshape(p.actor_model(𝐬[:, t, :]), 1, 1, size(𝐬, 3))
+            reshape(p.actor_model(𝐬[:, t, :]), :, 1, size(𝐬, 3))
         end
     end
-    𝛍 = p.actor_model(𝐬)
     log𝛔 = clamp.(p.logstd, -20f0, 2f0)
     𝛔 = (1f0 - Float32(p.deterministic)) * exp.(log𝛔)
 

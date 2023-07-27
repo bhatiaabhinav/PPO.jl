@@ -1,6 +1,6 @@
 using MDPs
 import MDPs: preexperiment, postepisode, poststep
-using UnPack
+using Base.Iterators: partition, product
 using Random
 using Flux
 using Flux.Zygote
@@ -9,18 +9,18 @@ import ProgressMeter: @showprogress, Progress, next!, finish!
 export PPOLearner
 
 """
-    PPOLearner(; envs, actor, critic, γ=0.99, nsteps=100, nepochs=10, trajs_per_minibatch=32, entropy_bonus=0.0, decay_ent_bonus=false, normalize_advantages=true, clipnorm=0.5, adam_weight_decay=0.0, adam_epsilon=1e-7, lr_actor=0.0003, lr_critic=0.0003, decay_lr=false, λ=0.95, ϵ=0.2, kl_target=0.01, ppo=true, early_stop_critic=false, device=cpu, progressmeter=false)
+    PPOLearner(; envs, actor, critic, γ=0.99, nsteps=2048, nepochs=10, batch_size=64, entropy_bonus=0.0, decay_ent_bonus=false, normalize_advantages=true, clipnorm=0.5, adam_weight_decay=0.0, adam_epsilon=1e-7, lr_actor=0.0003, lr_critic=0.0003, decay_lr=false, λ=0.95, ϵ=0.2, kl_target=Inf, ppo=true, early_stop_critic=false, device=cpu, progressmeter=false)
 
-A hook that performs an iteration of Proximal Policy Optimization (PPO) in `postepisode` callback.
+A hook that performs an iteration of Proximal Policy Optimization (PPO) in `postepisode` callback. Default hyperparameters are similar to those in Stable Baselines3 PPO implementation (https://stable-baselines3.readthedocs.io/en/master/modules/ppo.html).
 
 # Arguments
 - `envs::Vector{AbstractMDP}`: A vector of environments to collect data from. Multithreading is used to collect data in parallel. Julia should be started with multiple threads to take advantage of this.
 - `actor`: A PPO policy to optimize. Either PPOActorDiscrete or PPOActorContinuous.
 - `critic`: A Flux model with recurrence type same as actor.
 - `γ::Float32=0.99`: Discount factor. Used to calulate TD(λ) advantages.
-- `nsteps::Int=100`: Numer of steps per iteration. So that total data per iteration = nenvs * nsteps. With longer nsteps, TD(λ) returns are computed better.
+- `nsteps::Int=2048`: Numer of steps per iteration. So that total data per iteration = nenvs * nsteps. With longer nsteps, TD(λ) returns are computed better.
 - `nepochs::Int=10`: Number of epochs per iteration.
-- `trajs_per_minibatch::Int=32`: Number of trajectories per minibatch
+- `batch_size::Int=64`: Minibatch size. Should be a multiple of `nsteps` when using recurrent or transformer actor.
 - `entropy_bonus::Float32=0.0`: Coefficient of the entropy term in the overall PPO loss, to encourage exploration.
 - `decay_ent_bonus::Bool=false`: Whether to decay entropy bonus over time to 0, by the end of training (after `max_trials` iterations).
 - `normalize_advantages::Bool=true`: Whether to center and scale advantages to have zero mean and unit variance
@@ -32,7 +32,7 @@ A hook that performs an iteration of Proximal Policy Optimization (PPO) in `post
 - `decay_lr::Bool=false`: Whether to decay learning rate over time to 0, by the end of training (after `max_trials` iterations).
 - `λ::Float32=0.95`: Used to calulate TD(λ) advantages using Generalized Advantage Estimation (GAE) method.
 - `ϵ::Float32=0.2`: Epsilon used in PPO clip objective
-- `kl_target=0.01`: In each iteration, early stop actor training if KL divergence from old policy exceeds this value.
+- `kl_target=Inf`: In each iteration, early stop actor training if KL divergence from old policy exceeds this value. Disbled if `kl_target=Inf` (default). A commonly used value, when enabled, is 0.01.
 - `ppo=true`: Whether to use PPO clip objective. If false, standard advantange actor-critic (A2C) objective will be used.
 - `early_stop_critic=false`: Whether to early stop training critic (along with actor) if KL divergence from old policy exceeds `kl_target`.
 - `device=cpu`: `cpu` or `gpu`
@@ -43,9 +43,9 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
     actor::PPOActor
     critic                      # some model with recurrence type same as actor
     γ::Float32 = 0.99           # discount factor. Used to calulate TD(λ) advantages.
-    nsteps::Int = 100           # numer of steps per iteration. So that total data per iteration = nenvs * nsteps. With longer nsteps, TD(λ) returns are computed better.
+    nsteps::Int = 2048           # numer of steps per iteration. So that total data per iteration = nenvs * nsteps. With longer nsteps, TD(λ) returns are computed better.
     nepochs::Int = 10           # number of epochs per iteration.
-    trajs_per_minibatch::Int = 32    # number of trajectories per minibatch
+    batch_size::Int = 64        # minibatch size
     entropy_bonus::Float32 = 0.0f0 # coefficient of the entropy term in the overall PPO loss, to encourage exploration.
     decay_ent_bonus::Bool = false # whether to decay entropy bonus
     normalize_advantages::Bool = true # whether to center and scale advantages to have zero mean and unit variance
@@ -57,7 +57,7 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
     decay_lr::Bool = false      # whether to decay learning rate
     λ::Float32 = 0.95f0                  # Used to calulate TD(λ) advantages using Generalized Advantage Estimation (GAE) method.
     ϵ::Float32 = 0.2f0                   # epsilon used in PPO clip objective
-    kl_target = 0.01            # In each iteration, early stop training if KL divergence from old policy exceeds this value.
+    kl_target = Inf            # In each iteration, early stop training if KL divergence from old policy exceeds this value.
     ppo = true                  # whether to use PPO clip objective. If false, standard advantange actor-critic (A2C) objective will be used.
     early_stop_critic = false
     device = cpu                # `cpu` or `gpu`
@@ -77,13 +77,18 @@ function preexperiment(ppo::PPOLearner; rng, kwargs...)
 end
 
 function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...)
-    episodes = length(returns)
+    episodes, M, N = length(returns), ppo.nsteps, length(ppo.envs)
     if ppo.decay_lr
         actor_lr, critic_lr = (ppo.lr_actor, ppo.lr_critic) .* (1 - episodes / max_trials)
         ppo.optim_actor[end].eta, ppo.optim_critic[end].eta = actor_lr, critic_lr
         ppo.stats[:lr_actor], ppo.stats[:lr_critic] = actor_lr, critic_lr
     end
     entropy_bonus = ppo.decay_ent_bonus ? ppo.entropy_bonus * (1 - episodes / max_trials) : ppo.entropy_bonus
+    if ppo.actor.recurtype != MARKOV && ppo.batch_size % M != 0
+        new_batch_size = clamp(round(Int, ppo.batch_size / M) * M, M, M * N)
+        @warn "batch_size ($(ppo.batch_size)) is not a multiple of nsteps ($M). Changing batch_size to $new_batch_size"
+        ppo.batch_size = new_batch_size
+    end
 
     𝐬, 𝐚, 𝛑, log𝛑, 𝐫, 𝐭, 𝐝 = collect_trajectories(ppo, ppo.actor_gpu, ppo.device, rng) |> ppo.device
     if eltype(𝐚) <: Integer; 𝐚 = cpu(𝐚); end
@@ -94,21 +99,26 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
     θ = Flux.params(ppo.actor_gpu, ppo.critic_gpu)
     while length(losses) < ppo.nepochs
         desc = stop_actor_training ? "Train Critic Epoch $(length(losses)+1)" : "Train Actor-Critic Epoch $(length(losses)+1)"
-        progress = Progress(length(ppo.envs); desc=desc, color=:magenta, enabled=ppo.progressmeter)
+        progress = Progress(M * N; desc=desc, color=:magenta, enabled=ppo.progressmeter)
         loss, actor_loss, critic_loss = 0, 0, 0
-        for env_indices in Flux.chunk(1:length(ppo.envs), size=ppo.trajs_per_minibatch)
-            mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑 = @views map(𝐱 -> 𝐱[:, :, env_indices], (𝐬, 𝐚, 𝐯, 𝛅, 𝛑, log𝛑))
+        data_indices = cartesian_product(M, N)
+        data_indices = ppo.actor.recurtype == MARKOV ? shuffle(rng, data_indices) : data_indices
+        for mb_indices in partition(data_indices, ppo.batch_size)
+            mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑 = map(𝐱 -> 𝐱[:, mb_indices], (𝐬, 𝐚, 𝐯, 𝛅, 𝛑, log𝛑))
+            if ppo.actor.recurtype != MARKOV 
+                mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑 = map(𝐱 -> reshape(𝐱, :, M, length(mb_indices) ÷ M), (mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑))
+            end
             ∇ = gradient(θ) do
                 mb_loss, mb_actor_loss, mb_critic_loss = ppo_loss(ppo, ppo.actor_gpu, ppo.critic_gpu, mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑, Float32(!stop_actor_training), 0.5f0, entropy_bonus)
-                actor_loss += mb_actor_loss * length(env_indices) / length(ppo.envs)
-                critic_loss += mb_critic_loss * length(env_indices) / length(ppo.envs)
-                loss += mb_loss * length(env_indices) / length(ppo.envs)
+                actor_loss += mb_actor_loss * length(mb_indices) / (M * N)
+                critic_loss += mb_critic_loss * length(mb_indices) / (M * N)
+                loss += mb_loss * length(mb_indices) / (M * N)
                 return mb_loss
             end
             ppo.clipnorm < Inf && clip_global_norm!(∇, θ, ppo.clipnorm)
             !stop_actor_training && Flux.update!(ppo.optim_actor, Flux.params(ppo.actor_gpu), ∇)
             Flux.update!(ppo.optim_critic, Flux.params(ppo.critic_gpu), ∇)
-            next!(progress; step=length(env_indices))
+            next!(progress; step=length(mb_indices))
         end
         finish!(progress)
         push!(losses, loss)
@@ -156,19 +166,19 @@ function collect_trajectories(ppo::PPOLearner, actor, device, rng)
     end
     M, N = ppo.nsteps, length(ppo.envs)
 
-    𝐬 = zeros(Float32, state_dim, 0, N)
+    𝐬 = zeros(Float32, state_dim, M, N)
     if isdiscrete
-        𝐚 = zeros(Int, 1, 0, N)
-        𝛑 = zeros(Float32, nactions, 0, N)
-        log𝛑 = zeros(Float32, nactions, 0, N)
+        𝐚 = zeros(Int, 1, M, N)
+        𝛑 = zeros(Float32, nactions, M, N)
+        log𝛑 = zeros(Float32, nactions, M, N)
     else
-        𝐚 = zeros(Float32, action_dim, 0, N)
-        𝛑 = zeros(Float32, 1, 0, N)
-        log𝛑 = zeros(Float32, 1, 0, N)
+        𝐚 = zeros(Float32, action_dim, M, N)
+        𝛑 = zeros(Float32, 1, M, N)
+        log𝛑 = zeros(Float32, 1, M, N)
     end
-    𝐫 = zeros(Float32, 1, 0, N)
-    𝐭 = zeros(Float32, 1, 0, N)
-    𝐝 = zeros(Float32, 1, 0, N)
+    𝐫 = zeros(Float32, 1, M, N)
+    𝐭 = zeros(Float32, 1, M, N)
+    𝐝 = zeros(Float32, 1, M, N)
 
     progress = Progress(M; color=:white, desc="Collecting trajectories", enabled=ppo.progressmeter)
 
@@ -176,30 +186,30 @@ function collect_trajectories(ppo::PPOLearner, actor, device, rng)
     for t in 1:M
         Threads.@threads for env in ppo.envs; (in_absorbing_state(env) || truncated(env)) && reset!(env; rng=rng); end
         𝐬ₜ = mapfoldl(state, hcat, ppo.envs) |> tof32
-        𝐬 = cat(𝐬, reshape(𝐬ₜ, :, 1, N); dims=2)
+        𝐬[:, t, :] = 𝐬ₜ
 
         if isdiscrete
             @assert actor isa PPOActorDiscrete
             if ppo.actor.recurtype ∈ (MARKOV, RECURRENT)
                 𝛑ₜ, log𝛑ₜ = cpu(get_probs_logprobs(actor, device(𝐬ₜ)))
             elseif ppo.actor.recurtype == TRANSFORMER
-                𝛑ₜ, log𝛑ₜ = cpu(get_probs_logprobs(actor, device(𝐬)))
+                𝛑ₜ, log𝛑ₜ = cpu(get_probs_logprobs(actor, device(𝐬[:, 1:t, :])))
                 𝛑ₜ, log𝛑ₜ = 𝛑ₜ[:, end, :], log𝛑ₜ[:, end, :]
             end
             𝐚ₜ = reshape([sample(rng, 1:nactions, ProbabilityWeights(𝛑ₜ[:, i])) for i in 1:N], 1, N)
-            𝐚 = cat(𝐚, reshape(𝐚ₜ, 1, 1, N); dims=2)
-            𝛑 = cat(𝛑, reshape(𝛑ₜ, nactions, 1, N); dims=2)
-            log𝛑 = cat(log𝛑, reshape(log𝛑ₜ, nactions, 1, N); dims=2)
+            𝐚[:, t, :] = 𝐚ₜ
+            𝛑[:, t, :] = 𝛑ₜ
+            log𝛑[:, t, :] = log𝛑ₜ
         else
             @assert actor isa PPOActorContinuous
             if ppo.actor.recurtype ∈ (MARKOV, RECURRENT)
                 𝐚ₜ, log𝛑ₜ = cpu(sample_action_logprobs(actor, rng, device(𝐬ₜ)))
             else
-                𝐚ₜ, log𝛑ₜ = cpu(sample_action_logprobs(actor, rng, device(𝐬)))
+                𝐚ₜ, log𝛑ₜ = cpu(sample_action_logprobs(actor, rng, device(𝐬[:, 1:t, :])))
                 𝐚ₜ, log𝛑ₜ = 𝐚ₜ[:, end, :], log𝛑ₜ[:, end, :]
             end
-            𝐚 = cat(𝐚, reshape(𝐚ₜ, action_dim, 1, N); dims=2)
-            log𝛑 = cat(log𝛑, reshape(log𝛑ₜ, 1, 1, N); dims=2)
+            𝐚[:, t, :] = 𝐚ₜ
+            log𝛑[:, t, :] = log𝛑ₜ
             𝛑 = exp.(log𝛑)
         end
 
@@ -209,12 +219,12 @@ function collect_trajectories(ppo::PPOLearner, actor, device, rng)
         end
         
         𝐫ₜ = mapfoldl(reward, hcat, ppo.envs) |> tof32
-        𝐫 = cat(𝐫, reshape(𝐫ₜ, 1, 1, N); dims=2)
+        𝐫[:, t, :] = 𝐫ₜ
         𝐭ₜ = mapfoldl(in_absorbing_state, hcat, ppo.envs) |> tof32
-        𝐭 = cat(𝐭, reshape(𝐭ₜ, 1, 1, N); dims=2)
+        𝐭[:, t, :] = 𝐭ₜ
         𝐝ₜ = mapfoldl(env -> in_absorbing_state(env) || truncated(env), hcat, ppo.envs) |> tof32
-        𝐝 = cat(𝐝, reshape(𝐝ₜ, 1, 1, N); dims=2)
-        
+        𝐝[:, t, :] = 𝐝ₜ
+
         next!(progress)
     end
     finish!(progress)
