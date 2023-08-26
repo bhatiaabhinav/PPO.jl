@@ -14,7 +14,7 @@ export PPOLearner
 A hook that performs an iteration of Proximal Policy Optimization (PPO) in `postepisode` callback. Default hyperparameters are similar to those in Stable Baselines3 PPO implementation (https://stable-baselines3.readthedocs.io/en/master/modules/ppo.html).
 
 # Arguments
-- `envs::Vector{AbstractMDP}`: A vector of environments to collect data from. Multithreading is used to collect data in parallel. Julia should be started with multiple threads to take advantage of this.
+- `envs::Vector{AbstractMDP}`: A vector of environments to collect data from. Multithreading is used to collect data in parallel. Julia should be started with multiple threads to take advantage of this. Multithreading can be disabled by setting `multithreading=false`.
 - `actor`: A PPO policy to optimize. Either PPOActorDiscrete or PPOActorContinuous.
 - `critic`: A Flux model with recurrence type same as actor.
 - `γ::Float32=0.99`: Discount factor. Used to calulate TD(λ) advantages.
@@ -37,6 +37,7 @@ A hook that performs an iteration of Proximal Policy Optimization (PPO) in `post
 - `early_stop_critic=false`: Whether to early stop training critic (along with actor) if KL divergence from old policy exceeds `kl_target`.
 - `device=cpu`: `cpu` or `gpu`
 - `progressmeter=false`: Whether to show data and gradient updates progress using a progressmeter (useful for debugging).
+- `multithreading=true`: Whether to use multithreading to collect data in parallel. Julia should be started with multiple threads to take advantage of this.
 """
 Base.@kwdef mutable struct PPOLearner <: AbstractHook
     envs::Vector{AbstractMDP}   # A vector of environments.
@@ -62,6 +63,7 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
     early_stop_critic = false
     device = cpu                # `cpu` or `gpu`
     progressmeter::Bool = false # Whether to show data and gradient updates progress using a progressmeter
+    multithreading::Bool = true # Whether to use multithreading to collect data in parallel
 
     # data structures:
     optim_actor = make_adam_optim(lr_actor, (0.9, 0.999), adam_epsilon, 0)
@@ -73,7 +75,7 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
 end
 
 function preexperiment(ppo::PPOLearner; rng, kwargs...)
-    Threads.@threads for env in ppo.envs; reset!(env, rng=rng); end
+    for env in ppo.envs; reset!(env, rng=rng); end
 end
 
 function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...)
@@ -154,7 +156,17 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
 end
 
 
-
+function step_parallel!(envs::Vector{<:AbstractMDP}, actions; rng=Random.GLOBAL_RNG, multithreading=true)
+    if multithreading
+        Threads.@threads for i in 1:length(envs)
+            step!(envs[i], actions[i]; rng=rng)
+        end
+    else
+        for (env, a) in zip(envs, actions)
+            step!(env, a; rng=rng)
+        end
+    end
+end
 
 function collect_trajectories(ppo::PPOLearner, actor, device, rng)
     state_dim = size(state_space(ppo.envs[1]), 1)
@@ -184,7 +196,7 @@ function collect_trajectories(ppo::PPOLearner, actor, device, rng)
 
     Flux.reset!(actor)
     for t in 1:M
-        Threads.@threads for env in ppo.envs; (in_absorbing_state(env) || truncated(env)) && reset!(env; rng=rng); end
+        for env in ppo.envs; (in_absorbing_state(env) || truncated(env)) && reset!(env; rng=rng); end
         𝐬ₜ = mapfoldl(state, hcat, ppo.envs) |> tof32
         𝐬[:, t, :] = 𝐬ₜ
 
@@ -213,10 +225,14 @@ function collect_trajectories(ppo::PPOLearner, actor, device, rng)
             𝛑 = exp.(log𝛑)
         end
 
-        Threads.@threads for i in 1:N
-            a = isdiscrete ? 𝐚ₜ[1, i] : convert(eltype(action_space(ppo.envs[i])), 𝐚ₜ[:, i])
-            step!(ppo.envs[i], a; rng=rng)
+        if isdiscrete
+            _𝐚ₜ = 𝐚ₜ[1, :]
+        else
+            Tₐ = ppo.envs[1] |> action_space |> eltype |> eltype
+            _𝐚ₜ = convert(Matrix{Tₐ}, 𝐚ₜ) |> eachcol .|> copy    # eachcol makes it a vector of vectors
+            # println(typeof(_𝐚ₜ))
         end
+        step_parallel!(ppo.envs, _𝐚ₜ; rng=rng, multithreading=ppo.multithreading)
         
         𝐫ₜ = mapfoldl(reward, hcat, ppo.envs) |> tof32
         𝐫[:, t, :] = 𝐫ₜ
