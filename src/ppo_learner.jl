@@ -22,6 +22,7 @@ A hook that performs an iteration of Proximal Policy Optimization (PPO) in `post
 - `nepochs::Int=10`: Number of epochs per iteration.
 - `batch_size::Int=64`: Minibatch size. Should be a multiple of `nsteps` when using recurrent or transformer actor.
 - `entropy_bonus::Float32=0.0`: Coefficient of the entropy term in the overall PPO loss, to encourage exploration.
+- `entropy_method::Symbol=:regularized`: `:regularized` or `:maximized`. If `:regularized`, entropy bonus is added to the loss. If `:maximized`, entropy bonus is added to the reward at each timestep (as in SAC).
 - `decay_ent_bonus::Bool=false`: Whether to decay entropy bonus over time to 0, by the end of training (after `max_trials` iterations).
 - `normalize_advantages::Bool=true`: Whether to center and scale advantages to have zero mean and unit variance
 - `clipnorm::Float32=0.5`: Clip gradients by global norm
@@ -48,6 +49,7 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
     nepochs::Int = 10           # number of epochs per iteration.
     batch_size::Int = 64        # minibatch size
     entropy_bonus::Float32 = 0.0f0 # coefficient of the entropy term in the overall PPO loss, to encourage exploration.
+    entropy_method::Symbol = :regularized  # :regularized, :maximized
     decay_ent_bonus::Bool = false # whether to decay entropy bonus
     normalize_advantages::Bool = true # whether to center and scale advantages to have zero mean and unit variance
     clipnorm::Float32 = 0.5     # clip gradients by global norm
@@ -92,7 +94,7 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
         ppo.batch_size = new_batch_size
     end
 
-    𝐬, 𝐚, 𝛑, log𝛑, 𝐫, 𝐭, 𝐝 = collect_trajectories(ppo, ppo.actor_gpu, ppo.device, rng) |> ppo.device
+    𝐬, 𝐚, 𝛑, log𝛑, 𝐫, 𝐭, 𝐝 = collect_trajectories(ppo, ppo.actor_gpu, entropy_bonus, ppo.device, rng) |> ppo.device
     if eltype(𝐚) <: Integer; 𝐚 = cpu(𝐚); end
     𝐯, 𝛅 = get_values_advantages(ppo, ppo.critic_gpu, 𝐬, 𝐫, 𝐭, 𝐝, ppo.γ, ppo.λ)
 
@@ -132,7 +134,7 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
         end
         stop_actor_training && ppo.early_stop_critic && break
     end
-    H̄, v̄ = get_entropy(ppo.actor_gpu, 𝐬), mean(get_values(ppo.critic_gpu, 𝐬, ppo.actor.recurtype))
+    H̄, v̄ = mean(get_entropy(ppo.actor_gpu, 𝐬)), mean(get_values(ppo.critic_gpu, 𝐬, ppo.actor.recurtype))
 
     Flux.loadparams!(ppo.actor, Flux.params(ppo.actor_gpu))
     Flux.loadparams!(ppo.critic, Flux.params(ppo.critic_gpu))
@@ -168,7 +170,7 @@ function step_parallel!(envs::Vector{<:AbstractMDP}, actions; rng=Random.GLOBAL_
     end
 end
 
-function collect_trajectories(ppo::PPOLearner, actor, device, rng)
+function collect_trajectories(ppo::PPOLearner, actor, ent_coeff, device, rng)
     state_dim = size(state_space(ppo.envs[1]), 1)
     isdiscrete = action_space(ppo.envs[1]) isa IntegerSpace
     if isdiscrete
@@ -212,17 +214,19 @@ function collect_trajectories(ppo::PPOLearner, actor, device, rng)
             𝐚[:, t, :] = 𝐚ₜ
             𝛑[:, t, :] = 𝛑ₜ
             log𝛑[:, t, :] = log𝛑ₜ
+            ents = get_entropy(actor, 𝛑ₜ, log𝛑ₜ)
         else
             @assert actor isa PPOActorContinuous
             if ppo.actor.recurtype ∈ (MARKOV, RECURRENT)
-                𝐚ₜ, log𝛑ₜ = cpu(sample_action_logprobs(actor, rng, device(𝐬ₜ)))
+                𝐚ₜ, log𝛑ₜ, log𝛔ₜ = cpu(sample_action_logprobs(actor, rng, device(𝐬ₜ); return_logstd=true))
             else
-                𝐚ₜ, log𝛑ₜ = cpu(sample_action_logprobs(actor, rng, device(𝐬[:, 1:t, :])))
+                𝐚ₜ, log𝛑ₜ, log𝛔ₜ = cpu(sample_action_logprobs(actor, rng, device(𝐬[:, 1:t, :]); return_logstd=true))
                 𝐚ₜ, log𝛑ₜ = 𝐚ₜ[:, end, :], log𝛑ₜ[:, end, :]
             end
             𝐚[:, t, :] = 𝐚ₜ
             log𝛑[:, t, :] = log𝛑ₜ
             𝛑 = exp.(log𝛑)
+            ents = get_gaussian_entropy(log𝛔ₜ)
         end
 
         if isdiscrete
@@ -235,6 +239,10 @@ function collect_trajectories(ppo::PPOLearner, actor, device, rng)
         step_parallel!(ppo.envs, _𝐚ₜ; rng=rng, multithreading=ppo.multithreading)
         
         𝐫ₜ = mapfoldl(reward, hcat, ppo.envs) |> tof32
+        if ppo.entropy_method == :maximized && ent_coeff > 0
+            @assert size(ents) == size(𝐫ₜ)  "size mismatch: $(size(ents)) != $(size(𝐫ₜ))"
+            𝐫ₜ += ent_coeff * ents
+        end
         𝐫[:, t, :] = 𝐫ₜ
         𝐭ₜ = mapfoldl(in_absorbing_state, hcat, ppo.envs) |> tof32
         𝐭[:, t, :] = 𝐭ₜ
@@ -244,6 +252,12 @@ function collect_trajectories(ppo::PPOLearner, actor, device, rng)
         next!(progress)
     end
     finish!(progress)
+    # if ppo.entropy_method == :maximized && ent_coeff > 0
+    #     ents = get_entropy(actor, 𝐬)
+    #     # println("ents: ")
+    #     # display(ents)
+    #     𝐫 += ent_coeff * ents
+    # end
     return 𝐬, 𝐚, 𝛑, log𝛑, 𝐫, 𝐭, 𝐝
 end
 
@@ -270,5 +284,9 @@ function ppo_loss(ppo::PPOLearner, actor, critic, 𝐬, 𝐚, 𝐯, 𝛅, old�
     critic_loss = critic_coeff > 0 ? get_critic_loss(critic, 𝐬, 𝐯, 𝛅, ppo.actor.recurtype) : 0f0
     𝛅 = !ppo.normalize_advantages ? 𝛅 : Zygote.@ignore (𝛅 .- mean(𝛅)) ./ (std(𝛅) + 1e-8)
     actor_loss, entropy = actor_coeff > 0 ? get_loss_and_entropy(actor, 𝐬, 𝐚, 𝛅, old𝛑, oldlog𝛑, ppo.ϵ, ppo.ppo) : (0f0, 0f0)
-    return actor_loss + critic_coeff * critic_loss - ent_coeff * entropy, actor_loss, critic_loss
+    total_loss = actor_loss + critic_coeff * critic_loss
+    if ppo.entropy_method == :regularized && ent_coeff > 0
+        total_loss -= ent_coeff * entropy
+    end
+    return total_loss, actor_loss, critic_loss
 end

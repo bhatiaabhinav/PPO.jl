@@ -137,7 +137,7 @@ Get the entropy of the policy given the states 𝐬
 """
 function get_entropy(p::PPOActorDiscrete{T}, 𝐬::AbstractArray{Float32})::Float32 where {T}
     𝛑, log𝛑 = get_probs_logprobs(p, 𝐬)
-    return -sum(𝛑 .* log𝛑; dims=1) |> mean
+    return -sum(𝛑 .* log𝛑; dims=1)
 end
 
 """
@@ -146,7 +146,7 @@ end
 Get the entropy given the probabilities 𝛑 and log probabilities log𝛑.
 """
 function get_entropy(p::PPOActorDiscrete{T}, 𝛑, log𝛑)::Float32 where {T}
-    return -sum(𝛑 .* log𝛑; dims=1) |> mean
+    return -sum(𝛑 .* log𝛑; dims=1)
 end
 
 """
@@ -177,7 +177,7 @@ function get_loss_and_entropy(p::PPOActorDiscrete, 𝐬, 𝐚, 𝛅, old𝛑, ol
     else
         loss = -𝛅 .* log𝛑[𝐚] |> mean
     end
-    entropy = get_entropy(p, 𝛑, log𝛑)
+    entropy = get_entropy(p, 𝛑, log𝛑) |> mean
     return loss, entropy
 end
 
@@ -192,6 +192,7 @@ mutable struct PPOActorContinuous{Tₛ <: AbstractFloat, Tₐ <: AbstractFloat} 
     actor_model  # maps states to mean of action distribution
     deterministic::Bool
     
+    const state_dependent_noise::Bool
     logstd::AbstractVector{Float32}
     shift::AbstractVector{Float32}
     scale::AbstractVector{Float32}
@@ -202,25 +203,26 @@ end
 """
     PPOActorContinuous{Tₛ, Tₐ}(actor_model, deterministic::Bool, aspace::VectorSpace{Tₐ}, recurtype::RecurrenceType=MARKOV) where {Tₛ, Tₐ}
 
-Create a continuous actor for PPO with a continuous action space. The states and actions are of type `Vector{Tₛ}` and `Vector{Tₐ}` respectively. The actor model maps states to the mean of the action distribution, and can be a recurrent neural network or a transformer to handle sequential inputs. The standard deviation of the action distribution is a learnable parameter. The action is sampled from a normal distribution with the mean and standard deviation. The action is then squashed using the tanh function and scaled and shifted to fit the action space.
+Create a continuous actor for PPO with a continuous action space. The states and actions are of type `Vector{Tₛ}` and `Vector{Tₐ}` respectively. The actor model maps states to the mean of the action distribution, and can be a recurrent neural network or a transformer to handle sequential inputs. The standard deviation of the action distribution is a learnable parameter. The action is sampled from a normal distribution with the mean and standard deviation. The action is then squashed using the tanh function and scaled and shifted to fit the action space. # TODO: Describe the state-dependent noise case.
 
 # Arguments
 - `actor_model`: the Flux model
 - `deterministic`: whether to sample actions from the distribution (deterministic=false) or simply take the mean of the distribution (deterministic=true).
 - `aspace`: the action space
 - `recurtype`: the recurrence type, either `MARKOV`, `RECURRENT`, or `TRANSFORMER`. Defaults to `MARKOV` (no recurrence).
+- `state_dependent_noise=false`: whether the standard deviation of the action distribution is state-dependent. If true, the standard deviation is a function of the state. In that case, the actor model must return 2n outputs, where n is the dimension of the action space. The first n outputs are the mean of the action distribution, and the last n outputs are the log standard deviation of the action distribution. If false, the standard deviation is a learnable parameter that is independent of the state.
 """
-function PPOActorContinuous{Tₛ, Tₐ}(actor_model, deterministic::Bool, aspace::VectorSpace{Tₐ}, recurtype::RecurrenceType=MARKOV) where {Tₛ, Tₐ}
+function PPOActorContinuous{Tₛ, Tₐ}(actor_model, deterministic::Bool, aspace::VectorSpace{Tₐ}, recurtype::RecurrenceType=MARKOV; state_dependent_noise=false) where {Tₛ, Tₐ}
     n = size(aspace, 1)
     logstd = zeros(n) |> tof32
     shift = (aspace.lows + aspace.highs) / 2  |> tof32
     scale = (aspace.highs - aspace.lows) / 2  |> tof32
-    return PPOActorContinuous{Tₛ, Tₐ}(recurtype, actor_model, deterministic, logstd, shift, scale, Vector{Float32}[])
+    return PPOActorContinuous{Tₛ, Tₐ}(recurtype, actor_model, deterministic, state_dependent_noise, logstd, shift, scale, Vector{Float32}[])
 end
 
 Flux.@functor PPOActorContinuous (actor_model, logstd)
-Flux.gpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.gpu(p.actor_model), p.deterministic, Flux.gpu(p.logstd), Flux.gpu(p.shift), Flux.gpu(p.scale), p.observation_history)
-Flux.cpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.cpu(p.actor_model), p.deterministic, Flux.cpu(p.logstd), Flux.cpu(p.shift), Flux.cpu(p.scale), p.observation_history)
+Flux.gpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.gpu(p.actor_model), p.deterministic, p.state_dependent_noise,  Flux.gpu(p.logstd), Flux.gpu(p.shift), Flux.gpu(p.scale), p.observation_history)
+Flux.cpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.cpu(p.actor_model), p.deterministic, p.state_dependent_noise, Flux.cpu(p.logstd), Flux.cpu(p.shift), Flux.cpu(p.scale), p.observation_history)
 
 """
     (p::PPOActorContinuous{Tₛ, Tₐ})(rng::AbstractRNG, 𝐬::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
@@ -236,37 +238,7 @@ function (p::PPOActorContinuous{Tₛ, Tₐ})(𝐬::AbstractArray{Float32}, 𝐚:
     get_logprobs(p, 𝐬, 𝐚)
 end
 
-"""
-    sample_action_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, rng::AbstractRNG, 𝐬::AbstractArray{Float32})::Tuple{AbstractArray{Float32}, AbstractArray{Float32}} where {Tₛ, Tₐ}
-
-Given states 𝐬, samples and returns actions and their log probabilities. If input is of shape (state_dims, ntimesteps, batch_size), then outputs are of shape (action_dims, ntimesteps, batch_size) and (1, nsteps, batch_size) respectively. If input is of shape (state_dims, batch_size), then outputs are of shape (action_dims, batch_size) and (1, batch_size) respectively.
-"""
-function sample_action_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, rng::AbstractRNG, 𝐬::AbstractArray{Float32})::Tuple{AbstractArray{Float32}, AbstractArray{Float32}} where {Tₛ, Tₐ}
-    𝛍 = p.actor_model(𝐬)
-    log𝛔 = clamp.(p.logstd, -20f0, 2f0)
-    𝛔 = (1f0 - Float32(p.deterministic)) * exp.(log𝛔)
-    𝛏 = Flux.Zygote.@ignore convert(typeof(𝛍), randn(rng, Float32, size(𝛍)))
-    𝐚 = 𝛍 .+ 𝛔 .* 𝛏
-    log𝛑𝐚 = sum(log_nomal_prob.(𝐚, 𝛍, 𝛔), dims=1)
-    𝐚 = tanh.(𝐚)
-    log𝛑𝐚 = log𝛑𝐚 .- sum(log.(1f0 .- 𝐚 .^ 2 .+ 1f-6), dims=1)
-    𝐚 = p.shift .+ p.scale .* 𝐚
-    return 𝐚, log𝛑𝐚
-end
-
-"""
-    get_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
-
-Given states 𝐬 and actions 𝐚, returns log probabilities of actions. If input is of shape (state_dims, ntimesteps, batch_size), then outputs are of shape (1, nsteps, batch_size). If input is of shape (state_dims, batch_size), then outputs are of shape (1, batch_size).
-"""
-function get_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
-    @assert all(isfinite.(𝐚))
-    𝐚_unshifted_unscaled = (𝐚 .- p.shift) ./ p.scale
-    𝐚_unshifted_unscaled = clamp.(𝐚_unshifted_unscaled, -1f0 + 1f-3, 1f0 - 1f-3)    # because atanh(1.0) is infinite
-    @assert all(isfinite.(𝐚_unshifted_unscaled))
-    𝐚_untanhed = atanh.(𝐚_unshifted_unscaled)
-    @assert all(isfinite.(𝐚_untanhed))
-
+function get_mean_logstd(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Float32})::Tuple{AbstractArray{Float32}, AbstractArray{Float32}} where {Tₛ, Tₐ}
     if p.recurtype ∈ (MARKOV, TRANSFORMER) || ndims(𝐬) == 2
         𝛍 = p.actor_model(𝐬)
     else
@@ -276,32 +248,68 @@ function get_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Flo
             reshape(p.actor_model(𝐬[:, t, :]), :, 1, size(𝐬, 3))
         end
     end
-    log𝛔 = clamp.(p.logstd, -20f0, 2f0)
-    𝛔 = (1f0 - Float32(p.deterministic)) * exp.(log𝛔)
+    logstd = p.logstd
+    if p.state_dependent_noise
+        n::Int = length(p.scale)
+        𝛍, logstd = copy(selectdim(𝛍, 1, 1:n)), copy(selectdim(𝛍, 1, n+1:2n))
+    end
+    log𝛔 = clamp.(logstd, -20f0, 2f0)
+    return 𝛍, log𝛔
+end
 
+"""
+    sample_action_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, rng::AbstractRNG, 𝐬::AbstractArray{Float32}; return_logstd=false) where {Tₛ, Tₐ}
+
+Given states 𝐬, samples and returns actions and their log probabilities. If input is of shape (state_dims, ntimesteps, batch_size), then outputs are of shape (action_dims, ntimesteps, batch_size) and (1, nsteps, batch_size) respectively. If input is of shape (state_dims, batch_size), then outputs are of shape (action_dims, batch_size) and (1, batch_size) respectively. If return_logstd is true, then the log standard deviation of the action distribution (before squashing) is also returned.
+"""
+function sample_action_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, rng::AbstractRNG, 𝐬::AbstractArray{Float32}; return_logstd=false) where {Tₛ, Tₐ}
+    𝛍, log𝛔 = get_mean_logstd(p, 𝐬)
+    𝛔 = (1f0 - Float32(p.deterministic)) * exp.(log𝛔)
+    𝛏 = Flux.Zygote.@ignore convert(typeof(𝛍), randn(rng, Float32, size(𝛍)))
+    𝐚 = 𝛍 .+ 𝛔 .* 𝛏
+    log𝛑𝐚 = sum(log_nomal_prob.(𝐚, 𝛍, 𝛔), dims=1)
+    𝐚 = tanh.(𝐚)
+    log𝛑𝐚 = log𝛑𝐚 .- sum(log.(1f0 .- 𝐚 .^ 2 .+ 1f-6), dims=1)
+    𝐚 = p.shift .+ p.scale .* 𝐚
+    return return_logstd ? (𝐚, log𝛑𝐚, log𝛔) : (𝐚, log𝛑𝐚)
+end
+
+"""
+    get_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Float32}; return_logstd=false) where {Tₛ, Tₐ}
+
+Given states 𝐬 and actions 𝐚, returns log probabilities of actions. If input is of shape (state_dims, ntimesteps, batch_size), then outputs are of shape (1, nsteps, batch_size). If input is of shape (state_dims, batch_size), then outputs are of shape (1, batch_size). If return_logstd is true, then the log standard deviation of the action distribution (before squashing) is also returned.
+"""
+function get_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Float32}; return_logstd=false) where {Tₛ, Tₐ}
+    @assert all(isfinite.(𝐚))
+    𝐚_unshifted_unscaled = (𝐚 .- p.shift) ./ p.scale
+    𝐚_unshifted_unscaled = clamp.(𝐚_unshifted_unscaled, -1f0 + 1f-3, 1f0 - 1f-3)    # because atanh(1.0) is infinite
+    @assert all(isfinite.(𝐚_unshifted_unscaled))
+    𝐚_untanhed = atanh.(𝐚_unshifted_unscaled)
+    @assert all(isfinite.(𝐚_untanhed))
+
+    𝛍, log𝛔 = get_mean_logstd(p, 𝐬)
+    𝛔 = (1f0 - Float32(p.deterministic)) * exp.(log𝛔)
     log𝛑𝐚 = sum(log_nomal_prob.(𝐚_untanhed, 𝛍, 𝛔), dims=1)
     log𝛑𝐚 = log𝛑𝐚 .- sum(log.(1f0 .- 𝐚_unshifted_unscaled .^ 2 .+ 1f-6), dims=1)
 
-    return log𝛑𝐚
+    return return_logstd ? (log𝛑𝐚, log𝛔) : log𝛑𝐚
 end
 
 """
-    get_entropy(p::PPOActorContinuous{Tₛ, Tₐ})::Float32 where {Tₛ, Tₐ}
-
-Returns entropy of the policy. 
+    get_gaussian_entropy(logσ::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
+Returns entropies given logσ.
 """
-function get_entropy(p::PPOActorContinuous)
-    D = length(p.logstd)
-    logσ = clamp.(p.logstd, -20f0, 2f0)
-    return 0.5f0 * D * (1f0 + LOG_2PI) + sum(logσ)
+function get_gaussian_entropy(logσ::AbstractArray{Float32})::AbstractArray{Float32}
+    return sum(0.5f0 * (1f0 + LOG_2PI) .+ logσ, dims=1)
 end
 
 """
-    get_entropy(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Float32})::Float32 where {Tₛ, Tₐ}
-Returns entropy of the policy. Simply calls `get_entropy(p::PPOActorContinuous{Tₛ, Tₐ})::Float32 where {Tₛ, Tₐ}` since the entropy depends only on the standard deviation of the policy, which is independent of the state.
+    get_entropy(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
+Returns entropy of the policy for states 𝐬, without accounting for the squashing. Returns 1-element vector if state_dependent_noise is false, otherwise if input is of shape (state_dims, ntimesteps, batch_size), then outputs are of shape (1, nsteps, batch_size). If input is of shape (state_dims, batch_size), then outputs are of shape (1, batch_size).
 """
-function get_entropy(p::PPOActorContinuous, 𝐬)
-    get_entropy(p)
+function get_entropy(p::PPOActorContinuous, 𝐬::AbstractArray{Float32})::AbstractArray{Float32}
+    _, log𝛔 = get_mean_logstd(p, 𝐬)
+    return get_gaussian_entropy(log𝛔)
 end
 
 """
@@ -318,14 +326,14 @@ end
 
 
 function get_loss_and_entropy(p::PPOActorContinuous, 𝐬, 𝐚, 𝛅, old𝛑, oldlog𝛑, ϵ, use_clip_objective=true)
-    log𝛑 = get_logprobs(p, 𝐬, 𝐚)
+    log𝛑, log𝛔 = get_logprobs(p, 𝐬, 𝐚; return_logstd=true)
     𝑟 = exp.(log𝛑 .- oldlog𝛑)
     if use_clip_objective
         loss = -min.(𝑟 .* 𝛅, clamp.(𝑟, 1f0 - ϵ, 1f0 + ϵ) .* 𝛅) |> mean
     else
         loss = 𝛅 .* -log𝛑 |> mean
     end
-    entropy = get_entropy(p)
+    entropy = get_gaussian_entropy(log𝛔) |> mean
     return loss, entropy
 end
 
