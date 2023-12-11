@@ -14,7 +14,7 @@ export PPOLearner
 A hook that performs an iteration of Proximal Policy Optimization (PPO) in `postepisode` callback. Default hyperparameters are similar to those in Stable Baselines3 PPO implementation (https://stable-baselines3.readthedocs.io/en/master/modules/ppo.html).
 
 # Arguments
-- `envs::Vector{AbstractMDP}`: A vector of environments to collect data from. Multithreading is used to collect data in parallel. Julia should be started with multiple threads to take advantage of this. Multithreading can be disabled by setting `multithreading=false`.
+- `envs::AbstractVecEnv`: A collection of environments to collect data from. Should be of type `AbstractVecEnv`. See `VecEnv` in MDPs.jl to convert an array of environments to a single vectorized environment.
 - `actor`: A PPO policy to optimize. Either PPOActorDiscrete or PPOActorContinuous.
 - `critic`: A Flux model with recurrence type same as actor.
 - `γ::Float32=0.99`: Discount factor. Used to calulate TD(λ) advantages.
@@ -38,10 +38,9 @@ A hook that performs an iteration of Proximal Policy Optimization (PPO) in `post
 - `early_stop_critic=false`: Whether to early stop training critic (along with actor) if KL divergence from old policy exceeds `kl_target`.
 - `device=cpu`: `cpu` or `gpu`
 - `progressmeter=false`: Whether to show data and gradient updates progress using a progressmeter (useful for debugging).
-- `multithreading=true`: Whether to use multithreading to collect data in parallel. Julia should be started with multiple threads to take advantage of this.
 """
 Base.@kwdef mutable struct PPOLearner <: AbstractHook
-    envs::Vector{AbstractMDP}   # A vector of environments.
+    envs::AbstractVecEnv        # a vectorized environment
     actor::PPOActor
     critic                      # some model with recurrence type same as actor
     γ::Float32 = 0.99           # discount factor. Used to calulate TD(λ) advantages.
@@ -65,7 +64,6 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
     early_stop_critic = false
     device = cpu                # `cpu` or `gpu`
     progressmeter::Bool = false # Whether to show data and gradient updates progress using a progressmeter
-    multithreading::Bool = true # Whether to use multithreading to collect data in parallel
 
     # data structures:
     optim_actor = make_adam_optim(lr_actor, (0.9, 0.999), adam_epsilon, 0)
@@ -77,7 +75,7 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
 end
 
 function preexperiment(ppo::PPOLearner; rng, kwargs...)
-    for env in ppo.envs; reset!(env, rng=rng); end
+    reset!(ppo.envs; rng=rng)
 end
 
 function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...)
@@ -158,25 +156,13 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
 end
 
 
-function step_parallel!(envs::Vector{<:AbstractMDP}, actions; rng=Random.GLOBAL_RNG, multithreading=true)
-    if multithreading
-        Threads.@threads for i in 1:length(envs)
-            step!(envs[i], actions[i]; rng=rng)
-        end
-    else
-        for (env, a) in zip(envs, actions)
-            step!(env, a; rng=rng)
-        end
-    end
-end
-
 function collect_trajectories(ppo::PPOLearner, actor, ent_coeff, device, rng)
-    state_dim = size(state_space(ppo.envs[1]), 1)
-    isdiscrete = action_space(ppo.envs[1]) isa IntegerSpace
+    state_dim = size(state_space(ppo.envs), 1)
+    isdiscrete = action_space(ppo.envs) isa IntegerSpace
     if isdiscrete
-        nactions = length(action_space(ppo.envs[1]))
+        nactions = length(action_space(ppo.envs))
     else
-        action_dim = size(action_space(ppo.envs[1]), 1)
+        action_dim = size(action_space(ppo.envs), 1)
     end
     M, N = ppo.nsteps, length(ppo.envs)
 
@@ -198,8 +184,8 @@ function collect_trajectories(ppo::PPOLearner, actor, ent_coeff, device, rng)
 
     Flux.reset!(actor)
     for t in 1:M
-        for env in ppo.envs; (in_absorbing_state(env) || truncated(env)) && reset!(env; rng=rng); end
-        𝐬ₜ = mapfoldl(state, hcat, ppo.envs) |> tof32
+        reset!(ppo.envs, false; rng=rng)
+        𝐬ₜ = state(ppo.envs) |> tof32
         𝐬[:, t, :] = 𝐬ₜ
 
         if isdiscrete
@@ -232,38 +218,31 @@ function collect_trajectories(ppo::PPOLearner, actor, ent_coeff, device, rng)
         if isdiscrete
             _𝐚ₜ = 𝐚ₜ[1, :]
         else
-            Tₐ = ppo.envs[1] |> action_space |> eltype |> eltype
+            Tₐ = ppo.envs |> action_space |> eltype |> eltype
             _𝐚ₜ = convert(Matrix{Tₐ}, 𝐚ₜ) |> eachcol .|> copy    # eachcol makes it a vector of vectors
-            # println(typeof(_𝐚ₜ))
+            _𝐚ₜ = convert(Matrix{Tₐ}, 𝐚ₜ)
         end
-        step_parallel!(ppo.envs, _𝐚ₜ; rng=rng, multithreading=ppo.multithreading)
-        
-        𝐫ₜ = mapfoldl(reward, hcat, ppo.envs) |> tof32
+        step!(ppo.envs, _𝐚ₜ; rng=rng)
+        𝐫ₜ = reward(ppo.envs)' |> tof32
         if ppo.entropy_method == :maximized && ent_coeff > 0
             @assert size(ents) == size(𝐫ₜ)  "size mismatch: $(size(ents)) != $(size(𝐫ₜ))"
             𝐫ₜ += ent_coeff * ents
         end
         𝐫[:, t, :] = 𝐫ₜ
-        𝐭ₜ = mapfoldl(in_absorbing_state, hcat, ppo.envs) |> tof32
+        𝐭ₜ = in_absorbing_state(ppo.envs)' |> tof32
         𝐭[:, t, :] = 𝐭ₜ
-        𝐝ₜ = mapfoldl(env -> in_absorbing_state(env) || truncated(env), hcat, ppo.envs) |> tof32
+        𝐝ₜ = (in_absorbing_state(ppo.envs) .|| truncated(ppo.envs))' |> tof32
         𝐝[:, t, :] = 𝐝ₜ
 
         next!(progress)
     end
     finish!(progress)
-    # if ppo.entropy_method == :maximized && ent_coeff > 0
-    #     ents = get_entropy(actor, 𝐬)
-    #     # println("ents: ")
-    #     # display(ents)
-    #     𝐫 += ent_coeff * ents
-    # end
     return 𝐬, 𝐚, 𝛑, log𝛑, 𝐫, 𝐭, 𝐝
 end
 
 
 function get_values_advantages(ppo::PPOLearner, critic, 𝐬, 𝐫, 𝐭, 𝐝, γ, λ)
-    𝐬ₜ′ = unsqueeze(mapfoldl(state, hcat, ppo.envs), dims=2) |> tof32
+    𝐬ₜ′ = unsqueeze(state(ppo.envs), dims=2) |> tof32
     𝐬ₜ′ = convert(typeof(𝐬), 𝐬ₜ′)
     _𝐯 = get_values(critic, hcat(𝐬, 𝐬ₜ′), ppo.actor.recurtype)
     𝐯, 𝐯′ = _𝐯[:, 1:end-1, :], _𝐯[:, 2:end, :]

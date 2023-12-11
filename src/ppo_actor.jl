@@ -135,7 +135,7 @@ end
 
 Get the entropy of the policy given the states 𝐬
 """
-function get_entropy(p::PPOActorDiscrete{T}, 𝐬::AbstractArray{Float32})::Float32 where {T}
+function get_entropy(p::PPOActorDiscrete{T}, 𝐬::AbstractArray{Float32})::AbstractArray{Float32} where {T}
     𝛑, log𝛑 = get_probs_logprobs(p, 𝐬)
     return -sum(𝛑 .* log𝛑; dims=1)
 end
@@ -145,7 +145,7 @@ end
 
 Get the entropy given the probabilities 𝛑 and log probabilities log𝛑.
 """
-function get_entropy(p::PPOActorDiscrete{T}, 𝛑, log𝛑)::Float32 where {T}
+function get_entropy(p::PPOActorDiscrete{T}, 𝛑, log𝛑)::AbstractArray{Float32} where {T}
     return -sum(𝛑 .* log𝛑; dims=1)
 end
 
@@ -281,7 +281,7 @@ Given states 𝐬 and actions 𝐚, returns log probabilities of actions. If inp
 """
 function get_logprobs(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{Float32}, 𝐚::AbstractArray{Float32}; return_logstd=false) where {Tₛ, Tₐ}
     @assert all(isfinite.(𝐚))
-    𝐚_unshifted_unscaled = (𝐚 .- p.shift) ./ p.scale
+    𝐚_unshifted_unscaled = (𝐚 .- p.shift) ./ (p.scale .+ 1f-6)
     𝐚_unshifted_unscaled = clamp.(𝐚_unshifted_unscaled, -1f0 + 1f-3, 1f0 - 1f-3)    # because atanh(1.0) is infinite
     @assert all(isfinite.(𝐚_unshifted_unscaled))
     𝐚_untanhed = atanh.(𝐚_unshifted_unscaled)
