@@ -31,6 +31,7 @@ A hook that performs an iteration of Proximal Policy Optimization (PPO) in `post
 - `lr_actor::Float32=0.0003`: Adam learning rate for actor
 - `lr_critic::Float32=0.0003`: Adam learning rate for critic
 - `decay_lr::Bool=false`: Whether to decay learning rate over time to 0, by the end of training (after `max_trials` iterations).
+- `min_lr::Float32=1.25e-5`: Minimum learning rate to decay to
 - `λ::Float32=0.95`: Used to calulate TD(λ) advantages using Generalized Advantage Estimation (GAE) method.
 - `ϵ::Float32=0.2`: Epsilon used in PPO clip objective
 - `kl_target=Inf`: In each iteration, early stop actor training if KL divergence from old policy exceeds this value. Disbled if `kl_target=Inf` (default). A commonly used value, when enabled, is 0.01.
@@ -57,6 +58,7 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
     lr_actor::Float32 = 0.0003        # adam learning rate for actor
     lr_critic::Float32 = 0.0003        # adam learning rate for critic
     decay_lr::Bool = false      # whether to decay learning rate
+    min_lr::Float32 = 1.25e-5   # minimum learning rate to decay to
     λ::Float32 = 0.95f0                  # Used to calulate TD(λ) advantages using Generalized Advantage Estimation (GAE) method.
     ϵ::Float32 = 0.2f0                   # epsilon used in PPO clip objective
     kl_target = Inf            # In each iteration, early stop training if KL divergence from old policy exceeds this value.
@@ -82,6 +84,7 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
     episodes, M, N = length(returns), ppo.nsteps, length(ppo.envs)
     if ppo.decay_lr
         actor_lr, critic_lr = (ppo.lr_actor, ppo.lr_critic) .* (1 - episodes / max_trials)
+        actor_lr, critic_lr = max(actor_lr, ppo.min_lr), max(critic_lr, ppo.min_lr)
         ppo.optim_actor[end].eta, ppo.optim_critic[end].eta = actor_lr, critic_lr
         ppo.stats[:lr_actor], ppo.stats[:lr_critic] = actor_lr, critic_lr
     end
