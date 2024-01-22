@@ -15,6 +15,7 @@ mutable struct PPOActorDiscrete{T<:AbstractFloat} <: AbstractPolicy{Vector{T}, I
     const n::Int # number of actions
 
     const observation_history::Vector{Vector{Float32}}
+    const device
 end
 
 """
@@ -29,12 +30,13 @@ Construct a PPOActorDiscrete policy, where the states are of type Vector{T}. The
 - `recurtype`: the recurrence type of the neural network (MARKOV, RECURRENT, TRANSFORMER). Defaults to MARKOV (no recurrence).
 """
 function PPOActorDiscrete{T}(actor_model, deterministic::Bool, aspace::IntegerSpace, recurtype::RecurrenceType=MARKOV) where {T}
-    return PPOActorDiscrete{T}(recurtype, actor_model, deterministic, length(aspace), Vector{Float32}[])
+    device = isa(first(Flux.params(actor_model)), Array) ? Flux.cpu : Flux.gpu
+    return PPOActorDiscrete{T}(recurtype, actor_model, deterministic, length(aspace), Vector{Float32}[], device)
 end
 
 Flux.@functor PPOActorDiscrete (actor_model, )
-Flux.gpu(p::PPOActorDiscrete{T}) where {T}  = PPOActorDiscrete{T}(p.recurtype, Flux.gpu(p.actor_model), p.deterministic, p.n, p.observation_history)
-Flux.cpu(p::PPOActorDiscrete{T}) where {T}  = PPOActorDiscrete{T}(p.recurtype, Flux.cpu(p.actor_model), p.deterministic, p.n, p.observation_history)
+Flux.gpu(p::PPOActorDiscrete{T}) where {T}  = PPOActorDiscrete{T}(p.recurtype, Flux.gpu(p.actor_model), p.deterministic, p.n, p.observation_history, Flux.gpu)
+Flux.cpu(p::PPOActorDiscrete{T}) where {T}  = PPOActorDiscrete{T}(p.recurtype, Flux.cpu(p.actor_model), p.deterministic, p.n, p.observation_history, Flux.cpu)
 
 """
     (p::PPOActorDiscrete{T})(rng::AbstractRNG, 𝐬::AbstractArray{Float32})::VecOrMat{Int} where {T}
@@ -45,6 +47,7 @@ Sample actions from the policy given the states 𝐬. States 𝐬 are assumed to
 """
 function (p::PPOActorDiscrete{T})(rng::AbstractRNG, 𝐬::AbstractArray{Float32})::VecOrMat{Int} where {T}
     probabilities, logprobabilities = get_probs_logprobs(p, 𝐬)
+    probabilities = probabilities |> Flux.cpu
     if ndims(probabilities) == 3
         n, seq_len, batch_size = size(probabilities)
         𝐚 = zeros(Int, seq_len, batch_size)
@@ -57,7 +60,7 @@ function (p::PPOActorDiscrete{T})(rng::AbstractRNG, 𝐬::AbstractArray{Float32}
         n, batch_size = size(probabilities)
         𝐚 = zeros(Int, batch_size)
         for i in 1:batch_size
-            𝐚[i] = sample(rng, 1:n, ProbabilityWeights(probabilities[:, i]))
+            𝐚[i] = sample(rng, 1:n, ProbabilityWeights(@view probabilities[:, i]))
         end
     end
     return 𝐚
@@ -198,6 +201,7 @@ mutable struct PPOActorContinuous{Tₛ <: AbstractFloat, Tₐ <: AbstractFloat} 
     scale::AbstractVector{Float32}
 
     const observation_history::Vector{Vector{Float32}}
+    const device
 end
 
 """
@@ -217,12 +221,13 @@ function PPOActorContinuous{Tₛ, Tₐ}(actor_model, deterministic::Bool, aspace
     logstd = zeros(n) |> tof32
     shift = (aspace.lows + aspace.highs) / 2  |> tof32
     scale = (aspace.highs - aspace.lows) / 2  |> tof32
-    return PPOActorContinuous{Tₛ, Tₐ}(recurtype, actor_model, deterministic, state_dependent_noise, logstd, shift, scale, Vector{Float32}[])
+    device = isa(first(Flux.params(actor_model)), Array) ? Flux.cpu : Flux.gpu
+    return PPOActorContinuous{Tₛ, Tₐ}(recurtype, actor_model, deterministic, state_dependent_noise, logstd, shift, scale, Vector{Float32}[], device)
 end
 
 Flux.@functor PPOActorContinuous (actor_model, logstd)
-Flux.gpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.gpu(p.actor_model), p.deterministic, p.state_dependent_noise,  Flux.gpu(p.logstd), Flux.gpu(p.shift), Flux.gpu(p.scale), p.observation_history)
-Flux.cpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.cpu(p.actor_model), p.deterministic, p.state_dependent_noise, Flux.cpu(p.logstd), Flux.cpu(p.shift), Flux.cpu(p.scale), p.observation_history)
+Flux.gpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.gpu(p.actor_model), p.deterministic, p.state_dependent_noise,  Flux.gpu(p.logstd), Flux.gpu(p.shift), Flux.gpu(p.scale), p.observation_history, Flux.gpu)
+Flux.cpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.cpu(p.actor_model), p.deterministic, p.state_dependent_noise, Flux.cpu(p.logstd), Flux.cpu(p.shift), Flux.cpu(p.scale), p.observation_history, Flux.cpu)
 
 """
     (p::PPOActorContinuous{Tₛ, Tₐ})(rng::AbstractRNG, 𝐬::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
@@ -347,7 +352,7 @@ const PPOActor{Tₛ, Tₐ} = Union{PPOActorContinuous{Tₛ, Tₐ}, PPOActorDiscr
 function MDPs.preepisode(p::PPOActor; env, kwargs...)
     Flux.reset!(p.actor_model)
     empty!(p.observation_history)
-    p.recurtype == TRANSFORMER && push!(p.observation_history, tof32(deepcopy(state(env))))
+    p.recurtype == TRANSFORMER && push!(p.observation_history, p.device(tof32(deepcopy(state(env)))))
     nothing
 end
 
@@ -367,11 +372,12 @@ end
 
 function ppo_unified(p::PPOActor{Tₛ, Tₐ}, rng::AbstractRNG, s::Vector{Tₛ}) where {Tₛ, Tₐ}
     if p.recurtype == TRANSFORMER
-        push!(p.observation_history, tof32(deepcopy(s)))
+        push!(p.observation_history, p.device(tof32(deepcopy(s))))
+        # println("observation_history length: ", length(p.observation_history))
         s = hcat(p.observation_history...)
     end
-    𝐬 = s |> batch |> tof32
-    a = p(rng, 𝐬) |> unbatch
+    𝐬 = s |> batch |> tof32 |> p.device
+    a = p(rng, 𝐬) |> Flux.cpu |> unbatch
     if p.recurtype == TRANSFORMER
         a = unbatch_last(a)
     end
@@ -382,9 +388,9 @@ function ppo_unified(p::PPOActor{Tₛ, Tₐ}, s::Vector{Tₛ}, a::Union{Int, Vec
     if p.recurtype == TRANSFORMER
         s = hcat(p.observation_history...)
     end
-    𝐬 = s |> batch |> tof32
-    𝐚 = a |> batch
-    πa = p(𝐬, 𝐚) |> unbatch
+    𝐬 = s |> batch |> tof32 |> p.device
+    𝐚 = a |> batch |> p.device
+    πa = p(𝐬, 𝐚) |> Flux.cpu |> unbatch
     if p.recurtype == TRANSFORMER
         πa = unbatch_last(πa)
     end
