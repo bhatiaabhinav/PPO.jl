@@ -3,13 +3,14 @@ import MDPs: preexperiment, postepisode, poststep
 using Base.Iterators: partition, product
 using Random
 using Flux
+using CUDA
 using Flux.Zygote
 import ProgressMeter: @showprogress, Progress, next!, finish!
 
 export PPOLearner
 
 """
-    PPOLearner(; envs, actor, critic, γ=0.99, nsteps=2048, nepochs=10, batch_size=64, entropy_bonus=0.0, decay_ent_bonus=false, normalize_advantages=true, clipnorm=0.5, adam_weight_decay=0.0, adam_epsilon=1e-7, lr_actor=0.0003, lr_critic=0.0003, decay_lr=false, λ=0.95, ϵ=0.2, kl_target=Inf, ppo=true, early_stop_critic=false, device=cpu, progressmeter=false)
+    PPOLearner(; envs, actor, critic, γ=0.99, nsteps=2048, nepochs=10, batch_size=64, entropy_bonus=0.0, decay_ent_bonus=false, normalize_advantages=true, clipnorm=0.5, adam_weight_decay=0.0, adam_epsilon=1e-7, lr_actor=0.0003, lr_critic=0.0003, decay_lr=false, min_lr=1.25e-5, λ=0.95, ϵ=0.2, kl_target=Inf, ppo=true, early_stop_critic=false, device=cpu, progressmeter=false)
 
 A hook that performs an iteration of Proximal Policy Optimization (PPO) in `postepisode` callback. Default hyperparameters are similar to those in Stable Baselines3 PPO implementation (https://stable-baselines3.readthedocs.io/en/master/modules/ppo.html).
 
@@ -133,6 +134,7 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
             kl = get_kl_div(ppo.actor_gpu, 𝐬, 𝐚, 𝛑, log𝛑)
             stop_actor_training = kl >= ppo.kl_target
         end
+        GC.gc()
         stop_actor_training && ppo.early_stop_critic && break
     end
     H̄, v̄ = mean(get_entropy(ppo.actor_gpu, 𝐬)), mean(get_values(ppo.critic_gpu, 𝐬, ppo.actor.recurtype))
@@ -152,6 +154,18 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
     ppo.stats[:ent_bonus] = entropy_bonus
     if ppo.actor isa PPOActorContinuous
         ppo.stats[:logstd] = string(ppo.actor.logstd)
+    end
+
+    if ppo.device == gpu
+        CUDA.unsafe_free!(𝐬)
+        if !(eltype(𝐚) <: Integer)
+            CUDA.unsafe_free!(𝐚)
+        end
+        CUDA.unsafe_free!(𝛑)
+        CUDA.unsafe_free!(log𝛑)
+        CUDA.unsafe_free!(𝐫)
+        CUDA.unsafe_free!(𝐭)
+        CUDA.unsafe_free!(𝐝)
     end
 
     @debug "learning stats" steps episodes stats...
