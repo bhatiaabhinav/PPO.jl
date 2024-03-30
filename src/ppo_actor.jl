@@ -373,8 +373,7 @@ end
 function ppo_unified(p::PPOActor{Tₛ, Tₐ}, rng::AbstractRNG, s::Vector{Tₛ}) where {Tₛ, Tₐ}
     if p.recurtype == TRANSFORMER
         push!(p.observation_history, p.device(tof32(deepcopy(s))))
-        # println("observation_history length: ", length(p.observation_history))
-        s = hcat(p.observation_history...)
+        s = reduce(hcat, p.observation_history)
     end
     𝐬 = s |> batch |> tof32 |> p.device
     a = p(rng, 𝐬) |> Flux.cpu |> unbatch
@@ -386,7 +385,7 @@ end
 
 function ppo_unified(p::PPOActor{Tₛ, Tₐ}, s::Vector{Tₛ}, a::Union{Int, Vector{Tₐ}})::Float64 where {Tₛ, Tₐ}
     if p.recurtype == TRANSFORMER
-        s = hcat(p.observation_history...)
+        s = reduce(hcat, p.observation_history)
     end
     𝐬 = s |> batch |> tof32 |> p.device
     𝐚 = a |> batch |> p.device
