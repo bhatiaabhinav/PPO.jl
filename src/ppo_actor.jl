@@ -14,7 +14,8 @@ mutable struct PPOActorDiscrete{T<:AbstractFloat} <: AbstractPolicy{Vector{T}, I
     deterministic::Bool
     const n::Int # number of actions
 
-    const observation_history::Vector{Vector{Float32}}
+    observation_history::Union{AbstractMatrix{Float32}, Nothing}
+    obs_history_len::Int
     const device
 end
 
@@ -31,12 +32,12 @@ Construct a PPOActorDiscrete policy, where the states are of type Vector{T}. The
 """
 function PPOActorDiscrete{T}(actor_model, deterministic::Bool, aspace::IntegerSpace, recurtype::RecurrenceType=MARKOV) where {T}
     device = isa(first(Flux.params(actor_model)), Array) ? Flux.cpu : Flux.gpu
-    return PPOActorDiscrete{T}(recurtype, actor_model, deterministic, length(aspace), Vector{Float32}[], device)
+    return PPOActorDiscrete{T}(recurtype, actor_model, deterministic, length(aspace), nothing, 0, device)
 end
 
 Flux.@functor PPOActorDiscrete (actor_model, )
-Flux.gpu(p::PPOActorDiscrete{T}) where {T}  = PPOActorDiscrete{T}(p.recurtype, Flux.gpu(p.actor_model), p.deterministic, p.n, p.observation_history, Flux.gpu)
-Flux.cpu(p::PPOActorDiscrete{T}) where {T}  = PPOActorDiscrete{T}(p.recurtype, Flux.cpu(p.actor_model), p.deterministic, p.n, p.observation_history, Flux.cpu)
+Flux.gpu(p::PPOActorDiscrete{T}) where {T}  = PPOActorDiscrete{T}(p.recurtype, Flux.gpu(p.actor_model), p.deterministic, p.n, p.observation_history, p.obs_history_len, Flux.gpu)
+Flux.cpu(p::PPOActorDiscrete{T}) where {T}  = PPOActorDiscrete{T}(p.recurtype, Flux.cpu(p.actor_model), p.deterministic, p.n, p.observation_history, p.obs_history_len, Flux.cpu)
 
 """
     (p::PPOActorDiscrete{T})(rng::AbstractRNG, 𝐬::AbstractArray{Float32})::VecOrMat{Int} where {T}
@@ -200,7 +201,8 @@ mutable struct PPOActorContinuous{Tₛ <: AbstractFloat, Tₐ <: AbstractFloat} 
     shift::AbstractVector{Float32}
     scale::AbstractVector{Float32}
 
-    const observation_history::Vector{Vector{Float32}}
+    observation_history::Union{AbstractMatrix{Float32}, Nothing}
+    obs_history_len::Int
     const device
 end
 
@@ -222,12 +224,12 @@ function PPOActorContinuous{Tₛ, Tₐ}(actor_model, deterministic::Bool, aspace
     shift = (aspace.lows + aspace.highs) / 2  |> tof32
     scale = (aspace.highs - aspace.lows) / 2  |> tof32
     device = isa(first(Flux.params(actor_model)), Array) ? Flux.cpu : Flux.gpu
-    return PPOActorContinuous{Tₛ, Tₐ}(recurtype, actor_model, deterministic, state_dependent_noise, logstd, shift, scale, Vector{Float32}[], device)
+    return PPOActorContinuous{Tₛ, Tₐ}(recurtype, actor_model, deterministic, state_dependent_noise, logstd, shift, scale, nothing, 0, device)
 end
 
 Flux.@functor PPOActorContinuous (actor_model, logstd)
-Flux.gpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.gpu(p.actor_model), p.deterministic, p.state_dependent_noise,  Flux.gpu(p.logstd), Flux.gpu(p.shift), Flux.gpu(p.scale), p.observation_history, Flux.gpu)
-Flux.cpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.cpu(p.actor_model), p.deterministic, p.state_dependent_noise, Flux.cpu(p.logstd), Flux.cpu(p.shift), Flux.cpu(p.scale), p.observation_history, Flux.cpu)
+Flux.gpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.gpu(p.actor_model), p.deterministic, p.state_dependent_noise,  Flux.gpu(p.logstd), Flux.gpu(p.shift), Flux.gpu(p.scale), p.observation_history, p.obs_history_len, Flux.gpu)
+Flux.cpu(p::PPOActorContinuous{Tₛ, Tₐ}) where {Tₛ, Tₐ}  = PPOActorContinuous{Tₛ, Tₐ}(p.recurtype, Flux.cpu(p.actor_model), p.deterministic, p.state_dependent_noise, Flux.cpu(p.logstd), Flux.cpu(p.shift), Flux.cpu(p.scale), p.observation_history, p.obs_history_len, Flux.cpu)
 
 """
     (p::PPOActorContinuous{Tₛ, Tₐ})(rng::AbstractRNG, 𝐬::AbstractArray{Float32})::AbstractArray{Float32} where {Tₛ, Tₐ}
@@ -351,8 +353,14 @@ const PPOActor{Tₛ, Tₐ} = Union{PPOActorContinuous{Tₛ, Tₐ}, PPOActorDiscr
 
 function MDPs.preepisode(p::PPOActor; env, kwargs...)
     Flux.reset!(p.actor_model)
-    empty!(p.observation_history)
-    p.recurtype == TRANSFORMER && push!(p.observation_history, p.device(tof32(deepcopy(state(env)))))
+    if p.recurtype == TRANSFORMER
+        s = state(env)
+        if isnothing(p.observation_history)
+            p.observation_history = zeros(Float32, length(s), 2) |> p.device
+        end
+        p.obs_history_len = 1
+        p.observation_history[:, 1] = s
+    end
     nothing
 end
 
@@ -372,20 +380,33 @@ end
 
 function ppo_unified(p::PPOActor{Tₛ, Tₐ}, rng::AbstractRNG, s::Vector{Tₛ}) where {Tₛ, Tₐ}
     if p.recurtype == TRANSFORMER
-        push!(p.observation_history, p.device(tof32(deepcopy(s))))
-        s = reduce(hcat, p.observation_history)
-    end
-    𝐬 = s |> batch |> tof32 |> p.device
-    a = p(rng, 𝐬) |> Flux.cpu |> unbatch
-    if p.recurtype == TRANSFORMER
-        a = unbatch_last(a)
+        if size(p.observation_history, 2) == p.obs_history_len
+            new_buffer = zeros(Float32, length(s), 2 * p.obs_history_len) |> p.device
+            new_buffer[:, 1:p.obs_history_len] = p.observation_history
+            p.observation_history = new_buffer
+        end
+        p.obs_history_len += 1
+        p.observation_history[:, p.obs_history_len] = s
+        𝐬 = p.observation_history[:, 1:p.obs_history_len] |> batch
+        if p.device == Flux.gpu
+            a_gpu = p(rng, 𝐬)
+            a = a_gpu |> Flux.cpu |> unbatch |> unbatch_last
+            if p isa PPOActorContinuous
+                CUDA.unsafe_free!(a_gpu)
+            end
+        else
+            a = p(rng, 𝐬) |> unbatch |> unbatch_last
+        end
+    else
+        𝐬 = s |> batch |> tof32 |> p.device
+        a = p(rng, 𝐬) |> Flux.cpu |> unbatch
     end
     return a
 end
 
 function ppo_unified(p::PPOActor{Tₛ, Tₐ}, s::Vector{Tₛ}, a::Union{Int, Vector{Tₐ}})::Float64 where {Tₛ, Tₐ}
     if p.recurtype == TRANSFORMER
-        s = reduce(hcat, p.observation_history)
+        s = p.observation_history[:, 1:p.obs_history_len]
     end
     𝐬 = s |> batch |> tof32 |> p.device
     𝐚 = a |> batch |> p.device

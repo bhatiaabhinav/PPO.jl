@@ -134,7 +134,7 @@ function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...
             kl = get_kl_div(ppo.actor_gpu, 𝐬, 𝐚, 𝛑, log𝛑)
             stop_actor_training = kl >= ppo.kl_target
         end
-        GC.gc()
+        GC.gc(false)
         stop_actor_training && ppo.early_stop_critic && break
     end
     H̄, v̄ = mean(get_entropy(ppo.actor_gpu, 𝐬)), mean(get_values(ppo.critic_gpu, 𝐬, ppo.actor.recurtype))
@@ -208,9 +208,27 @@ function collect_trajectories(ppo::PPOLearner, actor, ent_coeff, device, rng)
         if isdiscrete
             @assert actor isa PPOActorDiscrete
             if ppo.actor.recurtype ∈ (MARKOV, RECURRENT)
-                𝛑ₜ, log𝛑ₜ = cpu(get_probs_logprobs(actor, device(𝐬ₜ)))
+                if device == gpu
+                    𝐬ₜ_gpu = gpu(𝐬ₜ)
+                    𝛑ₜ_gpu, log𝛑ₜ_gpu = get_probs_logprobs(actor, 𝐬ₜ_gpu)
+                    𝛑ₜ, log𝛑ₜ = cpu((𝛑ₜ_gpu, log𝛑ₜ_gpu))
+                    CUDA.unsafe_free!(𝐬ₜ_gpu)
+                    CUDA.unsafe_free!(𝛑ₜ_gpu)
+                    CUDA.unsafe_free!(log𝛑ₜ_gpu)
+                else
+                    𝛑ₜ, log𝛑ₜ = get_probs_logprobs(actor, 𝐬ₜ)
+                end
             elseif ppo.actor.recurtype == TRANSFORMER
-                𝛑ₜ, log𝛑ₜ = cpu(get_probs_logprobs(actor, device(𝐬[:, 1:t, :])))
+                if device == gpu
+                    𝐬ₜ_gpu = gpu(𝐬[:, 1:t, :])
+                    𝛑ₜ_gpu, log𝛑ₜ_gpu = get_probs_logprobs(actor, 𝐬ₜ_gpu)
+                    𝛑ₜ, log𝛑ₜ = cpu((𝛑ₜ_gpu, log𝛑ₜ_gpu))
+                    CUDA.unsafe_free!(𝐬ₜ_gpu)
+                    CUDA.unsafe_free!(𝛑ₜ_gpu)
+                    CUDA.unsafe_free!(log𝛑ₜ_gpu)
+                else
+                    𝛑ₜ, log𝛑ₜ = get_probs_logprobs(actor, 𝐬[:, 1:t, :])
+                end
                 𝛑ₜ, log𝛑ₜ = 𝛑ₜ[:, end, :], log𝛑ₜ[:, end, :]
             end
             𝐚ₜ = reshape([sample(rng, 1:nactions, ProbabilityWeights(𝛑ₜ[:, i])) for i in 1:N], 1, N)
@@ -221,9 +239,29 @@ function collect_trajectories(ppo::PPOLearner, actor, ent_coeff, device, rng)
         else
             @assert actor isa PPOActorContinuous
             if ppo.actor.recurtype ∈ (MARKOV, RECURRENT)
-                𝐚ₜ, log𝛑ₜ, log𝛔ₜ = cpu(sample_action_logprobs(actor, rng, device(𝐬ₜ); return_logstd=true))
+                if device == gpu
+                    𝐬ₜ_gpu = gpu(𝐬ₜ)
+                    𝐚ₜ_gpu, log𝛑ₜ_gpu, log𝛔ₜ_gpu = sample_action_logprobs(actor, rng, 𝐬ₜ_gpu; return_logstd=true)
+                    𝐚ₜ, log𝛑ₜ, log𝛔ₜ = cpu((𝐚ₜ_gpu, log𝛑ₜ_gpu, log𝛔ₜ_gpu))
+                    CUDA.unsafe_free!(𝐬ₜ_gpu)
+                    CUDA.unsafe_free!(𝐚ₜ_gpu)
+                    CUDA.unsafe_free!(log𝛑ₜ_gpu)
+                    CUDA.unsafe_free!(log𝛔ₜ_gpu)
+                else
+                    𝐚ₜ, log𝛑ₜ, log𝛔ₜ = sample_action_logprobs(actor, rng, 𝐬ₜ; return_logstd=true)
+                end
             else
-                𝐚ₜ, log𝛑ₜ, log𝛔ₜ = cpu(sample_action_logprobs(actor, rng, device(𝐬[:, 1:t, :]); return_logstd=true))
+                if device == gpu
+                    𝐬ₜ_gpu = gpu(𝐬[:, 1:t, :])
+                    𝐚ₜ_gpu, log𝛑ₜ_gpu, log𝛔ₜ_gpu = sample_action_logprobs(actor, rng, 𝐬ₜ_gpu; return_logstd=true)
+                    𝐚ₜ, log𝛑ₜ, log𝛔ₜ = cpu((𝐚ₜ_gpu, log𝛑ₜ_gpu, log𝛔ₜ_gpu))
+                    CUDA.unsafe_free!(𝐬ₜ_gpu)
+                    CUDA.unsafe_free!(𝐚ₜ_gpu)
+                    CUDA.unsafe_free!(log𝛑ₜ_gpu)
+                    CUDA.unsafe_free!(log𝛔ₜ_gpu)
+                else
+                    𝐚ₜ, log𝛑ₜ, log𝛔ₜ = sample_action_logprobs(actor, rng, 𝐬[:, 1:t, :]; return_logstd=true)
+                end
                 𝐚ₜ, log𝛑ₜ = 𝐚ₜ[:, end, :], log𝛑ₜ[:, end, :]
             end
             𝐚[:, t, :] = 𝐚ₜ
