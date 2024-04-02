@@ -1,7 +1,7 @@
 name = "PPO"
 uuid = "ab55b8be-cc8b-4ed9-9cfe-88b52d9ac2d7"
 authors = ["Abhinav Bhatia <abhinav.bhatia.me@gmail.com>"]
-version = "3.7.3"
+version = "3.8.0"
 
 [deps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"

@@ -10,7 +10,7 @@ import ProgressMeter: @showprogress, Progress, next!, finish!
 export PPOLearner
 
 """
-    PPOLearner(; envs, actor, critic, γ=0.99, nsteps=2048, nepochs=10, batch_size=64, entropy_bonus=0.0, decay_ent_bonus=false, normalize_advantages=true, clipnorm=0.5, adam_weight_decay=0.0, adam_epsilon=1e-7, lr_actor=0.0003, lr_critic=0.0003, decay_lr=false, min_lr=1.25e-5, λ=0.95, ϵ=0.2, kl_target=Inf, ppo=true, early_stop_critic=false, device=cpu, progressmeter=false)
+    PPOLearner(; envs, actor, critic, γ=0.99, nsteps=2048, nepochs=10, batch_size=64, entropy_bonus=0.0, decay_ent_bonus=false, normalize_advantages=true, clipnorm=0.5, adam_weight_decay=0.0, adam_epsilon=1e-7, lr_actor=0.0003, lr_critic=0.0003, decay_lr=false, min_lr=1.25e-5, λ=0.95, ϵ=0.2, kl_target=Inf, ppo=true, early_stop_critic=false, device=cpu, progressmeter=false, iters_per_postepisode::Int=1)
 
 A hook that performs an iteration of Proximal Policy Optimization (PPO) in `postepisode` callback. Default hyperparameters are similar to those in Stable Baselines3 PPO implementation (https://stable-baselines3.readthedocs.io/en/master/modules/ppo.html).
 
@@ -40,6 +40,7 @@ A hook that performs an iteration of Proximal Policy Optimization (PPO) in `post
 - `early_stop_critic=false`: Whether to early stop training critic (along with actor) if KL divergence from old policy exceeds `kl_target`.
 - `device=cpu`: `cpu` or `gpu`
 - `progressmeter=false`: Whether to show data and gradient updates progress using a progressmeter (useful for debugging).
+- `iters_per_postepisode::Int=1`: Number of training iterations per postepisode callback. Useful for debugging.
 """
 Base.@kwdef mutable struct PPOLearner <: AbstractHook
     envs::AbstractVecEnv        # a vectorized environment
@@ -67,6 +68,7 @@ Base.@kwdef mutable struct PPOLearner <: AbstractHook
     early_stop_critic = false
     device = cpu                # `cpu` or `gpu`
     progressmeter::Bool = false # Whether to show data and gradient updates progress using a progressmeter
+    iters_per_postepisode::Int = 1  # number of training iterations per postepisode callback
 
     # data structures:
     optim_actor = make_adam_optim(lr_actor, (0.9, 0.999), adam_epsilon, 0)
@@ -79,96 +81,105 @@ end
 
 function preexperiment(ppo::PPOLearner; rng, kwargs...)
     reset!(ppo.envs; rng=rng)
+    ppo.stats[:iterations] = 0
 end
 
-function postepisode(ppo::PPOLearner; returns, steps, max_trials, rng, kwargs...)
-    episodes, M, N = length(returns), ppo.nsteps, length(ppo.envs)
+function postepisode(ppo::PPOLearner; returns, max_trials, rng, kwargs...)
+    M, N = ppo.nsteps, length(ppo.envs)
+    experiment_progress = length(returns) / max_trials
     if ppo.decay_lr
-        actor_lr, critic_lr = (ppo.lr_actor, ppo.lr_critic) .* (1 - episodes / max_trials)
+        actor_lr, critic_lr = (ppo.lr_actor, ppo.lr_critic) .* (1 - experiment_progress)
         actor_lr, critic_lr = max(actor_lr, ppo.min_lr), max(critic_lr, ppo.min_lr)
         ppo.optim_actor[end].eta, ppo.optim_critic[end].eta = actor_lr, critic_lr
         ppo.stats[:lr_actor], ppo.stats[:lr_critic] = actor_lr, critic_lr
     end
-    entropy_bonus = ppo.decay_ent_bonus ? ppo.entropy_bonus * (1 - episodes / max_trials) : ppo.entropy_bonus
+    entropy_bonus = ppo.decay_ent_bonus ? ppo.entropy_bonus * (1 - experiment_progress) : ppo.entropy_bonus
     if ppo.actor.recurtype != MARKOV && ppo.batch_size % M != 0
         new_batch_size = clamp(round(Int, ppo.batch_size / M) * M, M, M * N)
         @warn "batch_size ($(ppo.batch_size)) is not a multiple of nsteps ($M). Changing batch_size to $new_batch_size"
         ppo.batch_size = new_batch_size
     end
 
-    𝐬, 𝐚, 𝛑, log𝛑, 𝐫, 𝐭, 𝐝 = collect_trajectories(ppo, ppo.actor_gpu, entropy_bonus, ppo.device, rng) |> ppo.device
-    if eltype(𝐚) <: Integer; 𝐚 = cpu(𝐚); end
-    𝐯, 𝛅 = get_values_advantages(ppo, ppo.critic_gpu, 𝐬, 𝐫, 𝐭, 𝐝, ppo.γ, ppo.λ)
+    function do_full_ppo_iteration()
+        𝐬, 𝐚, 𝛑, log𝛑, 𝐫, 𝐭, 𝐝 = collect_trajectories(ppo, ppo.actor_gpu, entropy_bonus, ppo.device, rng) |> ppo.device
+        if eltype(𝐚) <: Integer; 𝐚 = cpu(𝐚); end
+        𝐯, 𝛅 = get_values_advantages(ppo, ppo.critic_gpu, 𝐬, 𝐫, 𝐭, 𝐝, ppo.γ, ppo.λ)
 
-    stop_actor_training, kl = false, 0f0
-    losses, actor_losses, critic_losses = [], [], []
-    θ = Flux.params(ppo.actor_gpu, ppo.critic_gpu)
-    while length(losses) < ppo.nepochs
-        desc = stop_actor_training ? "Train Critic Epoch $(length(losses)+1)" : "Train Actor-Critic Epoch $(length(losses)+1)"
-        progress = Progress(M * N; desc=desc, color=:magenta, enabled=ppo.progressmeter)
-        loss, actor_loss, critic_loss = 0, 0, 0
-        data_indices = cartesian_product(M, N)
-        data_indices = ppo.actor.recurtype == MARKOV ? shuffle(rng, data_indices) : data_indices
-        for mb_indices in partition(data_indices, ppo.batch_size)
-            mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑 = map(𝐱 -> 𝐱[:, mb_indices], (𝐬, 𝐚, 𝐯, 𝛅, 𝛑, log𝛑))
-            if ppo.actor.recurtype != MARKOV 
-                mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑 = map(𝐱 -> reshape(𝐱, :, M, length(mb_indices) ÷ M), (mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑))
+        stop_actor_training, kl = false, 0f0
+        losses, actor_losses, critic_losses = [], [], []
+        θ = Flux.params(ppo.actor_gpu, ppo.critic_gpu)
+        while length(losses) < ppo.nepochs
+            desc = stop_actor_training ? "Train Critic Epoch $(length(losses)+1)" : "Train Actor-Critic Epoch $(length(losses)+1)"
+            progress = Progress(M * N; desc=desc, color=:magenta, enabled=ppo.progressmeter)
+            loss, actor_loss, critic_loss = 0, 0, 0
+            data_indices = cartesian_product(M, N)
+            data_indices = ppo.actor.recurtype == MARKOV ? shuffle(rng, data_indices) : data_indices
+            for mb_indices in partition(data_indices, ppo.batch_size)
+                mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑 = map(𝐱 -> 𝐱[:, mb_indices], (𝐬, 𝐚, 𝐯, 𝛅, 𝛑, log𝛑))
+                if ppo.actor.recurtype != MARKOV 
+                    mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑 = map(𝐱 -> reshape(𝐱, :, M, length(mb_indices) ÷ M), (mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑))
+                end
+                ∇ = gradient(θ) do
+                    mb_loss, mb_actor_loss, mb_critic_loss = ppo_loss(ppo, ppo.actor_gpu, ppo.critic_gpu, mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑, Float32(!stop_actor_training), 0.5f0, entropy_bonus)
+                    actor_loss += mb_actor_loss * length(mb_indices) / (M * N)
+                    critic_loss += mb_critic_loss * length(mb_indices) / (M * N)
+                    loss += mb_loss * length(mb_indices) / (M * N)
+                    return mb_loss
+                end
+                ppo.clipnorm < Inf && clip_global_norm!(∇, θ, ppo.clipnorm)
+                !stop_actor_training && Flux.update!(ppo.optim_actor, Flux.params(ppo.actor_gpu), ∇)
+                Flux.update!(ppo.optim_critic, Flux.params(ppo.critic_gpu), ∇)
+                next!(progress; step=length(mb_indices))
             end
-            ∇ = gradient(θ) do
-                mb_loss, mb_actor_loss, mb_critic_loss = ppo_loss(ppo, ppo.actor_gpu, ppo.critic_gpu, mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑, Float32(!stop_actor_training), 0.5f0, entropy_bonus)
-                actor_loss += mb_actor_loss * length(mb_indices) / (M * N)
-                critic_loss += mb_critic_loss * length(mb_indices) / (M * N)
-                loss += mb_loss * length(mb_indices) / (M * N)
-                return mb_loss
+            finish!(progress)
+            push!(losses, loss)
+            push!(critic_losses, critic_loss)
+            if !stop_actor_training
+                push!(actor_losses, actor_loss)
+                kl = get_kl_div(ppo.actor_gpu, 𝐬, 𝐚, 𝛑, log𝛑)
+                stop_actor_training = kl >= ppo.kl_target
             end
-            ppo.clipnorm < Inf && clip_global_norm!(∇, θ, ppo.clipnorm)
-            !stop_actor_training && Flux.update!(ppo.optim_actor, Flux.params(ppo.actor_gpu), ∇)
-            Flux.update!(ppo.optim_critic, Flux.params(ppo.critic_gpu), ∇)
-            next!(progress; step=length(mb_indices))
+            GC.gc(false)
+            stop_actor_training && ppo.early_stop_critic && break
         end
-        finish!(progress)
-        push!(losses, loss)
-        push!(critic_losses, critic_loss)
-        if !stop_actor_training
-            push!(actor_losses, actor_loss)
-            kl = get_kl_div(ppo.actor_gpu, 𝐬, 𝐚, 𝛑, log𝛑)
-            stop_actor_training = kl >= ppo.kl_target
+        H̄, v̄ = mean(get_entropy(ppo.actor_gpu, 𝐬)), mean(get_values(ppo.critic_gpu, 𝐬, ppo.actor.recurtype))
+
+        Flux.loadparams!(ppo.actor, Flux.params(ppo.actor_gpu))
+        Flux.loadparams!(ppo.critic, Flux.params(ppo.critic_gpu))
+
+        ppo.stats[:ℓ] = losses[end]
+        ppo.stats[:actor_loss] = actor_losses[end]
+        ppo.stats[:critic_loss] = critic_losses[end]
+        ppo.stats[:H̄] = H̄
+        ppo.stats[:iteration_kl] = kl
+        ppo.stats[:v̄] = v̄
+        ppo.stats[:iteration_actor_epochs] = length(actor_losses)
+        ppo.stats[:iteration_critic_epochs] = length(critic_losses)
+        ppo.stats[:iterations] += 1
+        ppo.stats[:ent_bonus] = entropy_bonus
+        ppo.stats[:iteration_R̄] = mean(sum(𝐫, dims=2))
+        ppo.stats[:iteration_r̄] = ppo.stats[:iteration_R̄] / M
+        if ppo.actor isa PPOActorContinuous
+            ppo.stats[:logstd] = string(ppo.actor.logstd)
         end
-        GC.gc(false)
-        stop_actor_training && ppo.early_stop_critic && break
-    end
-    H̄, v̄ = mean(get_entropy(ppo.actor_gpu, 𝐬)), mean(get_values(ppo.critic_gpu, 𝐬, ppo.actor.recurtype))
 
-    Flux.loadparams!(ppo.actor, Flux.params(ppo.actor_gpu))
-    Flux.loadparams!(ppo.critic, Flux.params(ppo.critic_gpu))
-
-    ppo.stats[:ℓ] = losses[end]
-    ppo.stats[:actor_loss] = actor_losses[end]
-    ppo.stats[:critic_loss] = critic_losses[end]
-    ppo.stats[:H̄] = H̄
-    ppo.stats[:iteration_kl] = kl
-    ppo.stats[:v̄] = v̄
-    ppo.stats[:iteration_actor_epochs] = length(actor_losses)
-    ppo.stats[:iteration_critic_epochs] = length(critic_losses)
-    ppo.stats[:iterations] = episodes
-    ppo.stats[:ent_bonus] = entropy_bonus
-    if ppo.actor isa PPOActorContinuous
-        ppo.stats[:logstd] = string(ppo.actor.logstd)
-    end
-
-    if ppo.device == gpu
-        CUDA.unsafe_free!(𝐬)
-        if !(eltype(𝐚) <: Integer)
-            CUDA.unsafe_free!(𝐚)
+        if ppo.device == gpu
+            CUDA.unsafe_free!(𝐬)
+            if !(eltype(𝐚) <: Integer)
+                CUDA.unsafe_free!(𝐚)
+            end
+            CUDA.unsafe_free!(𝛑)
+            CUDA.unsafe_free!(log𝛑)
+            CUDA.unsafe_free!(𝐫)
+            CUDA.unsafe_free!(𝐭)
+            CUDA.unsafe_free!(𝐝)
         end
-        CUDA.unsafe_free!(𝛑)
-        CUDA.unsafe_free!(log𝛑)
-        CUDA.unsafe_free!(𝐫)
-        CUDA.unsafe_free!(𝐭)
-        CUDA.unsafe_free!(𝐝)
     end
 
-    @debug "learning stats" steps episodes stats...
+    for iter_num in 1:ppo.iters_per_postepisode
+        do_full_ppo_iteration()
+    end
+
     nothing
 end
 
@@ -197,7 +208,7 @@ function collect_trajectories(ppo::PPOLearner, actor, ent_coeff, device, rng)
     𝐭 = zeros(Float32, 1, M, N)
     𝐝 = zeros(Float32, 1, M, N)
 
-    progress = Progress(M; color=:white, desc="Collecting trajectories", enabled=ppo.progressmeter)
+    progress = Progress(M; color=:white, desc="(Iter $(ppo.stats[:iterations] + 1)) Collecting trajectories", enabled=ppo.progressmeter)
 
     Flux.reset!(actor)
     for t in 1:M
