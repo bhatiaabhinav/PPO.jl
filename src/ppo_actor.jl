@@ -224,7 +224,7 @@ function PPOActorContinuous{Tₛ, Tₐ}(actor_model, deterministic::Bool, aspace
     shift = (aspace.lows + aspace.highs) / 2  |> tof32
     scale = (aspace.highs - aspace.lows) / 2  |> tof32
     device = isa(first(Flux.params(actor_model)), Array) ? Flux.cpu : Flux.gpu
-    return PPOActorContinuous{Tₛ, Tₐ}(recurtype, actor_model, deterministic, state_dependent_noise, logstd, shift, scale, nothing, 0, device)
+    return PPOActorContinuous{Tₛ, Tₐ}(recurtype, actor_model, deterministic, state_dependent_noise, device(logstd), device(shift), device(scale), nothing, 0, device)
 end
 
 Flux.@functor PPOActorContinuous (actor_model, logstd)
@@ -388,18 +388,10 @@ function ppo_unified(p::PPOActor{Tₛ, Tₐ}, rng::AbstractRNG, s::Vector{Tₛ})
         p.obs_history_len += 1
         p.observation_history[:, p.obs_history_len] = s
         𝐬 = p.observation_history[:, 1:p.obs_history_len] |> batch
-        if p.device == Flux.gpu
-            a_gpu = p(rng, 𝐬)
-            a = a_gpu |> Flux.cpu |> unbatch |> unbatch_last
-            if p isa PPOActorContinuous
-                CUDA.unsafe_free!(a_gpu)
-            end
-        else
-            a = p(rng, 𝐬) |> unbatch |> unbatch_last
-        end
+        a = p(rng, 𝐬) |> cpu |> unbatch |> unbatch_last
     else
         𝐬 = s |> batch |> tof32 |> p.device
-        a = p(rng, 𝐬) |> Flux.cpu |> unbatch
+        a = p(rng, 𝐬) |> cpu |> unbatch
     end
     return a
 end
