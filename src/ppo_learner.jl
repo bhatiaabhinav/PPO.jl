@@ -180,7 +180,11 @@ function collect_trajectories(ppo::PPOLearner, actor, ent_coeff, device, rng)
     end
     M, N = ppo.nsteps, length(ppo.envs)
 
-    𝐬 = zeros(Float32, state_dim, M, N)
+    if state_dim > 50
+        𝐬 = zeros(Float32, state_dim, M, N) |> device
+    else
+        𝐬 = zeros(Float32, state_dim, M, N)
+    end
     if isdiscrete
         𝐚 = zeros(Int, 1, M, N)
         𝛑 = zeros(Float32, nactions, M, N)
@@ -200,15 +204,26 @@ function collect_trajectories(ppo::PPOLearner, actor, ent_coeff, device, rng)
     for t in 1:M
         reset!(ppo.envs, false; rng=rng)
         𝐬ₜ = state(ppo.envs) |> tof32
-        𝐬[:, t, :] = 𝐬ₜ
-
+        if state_dim > 50
+            𝐬[:, t, :] .= device(𝐬ₜ)
+        else
+            𝐬[:, t, :] .= 𝐬ₜ
+        end
         if isdiscrete
             @assert actor isa PPOActorDiscrete
             if ppo.actor.recurtype ∈ (MARKOV, RECURRENT)
                 𝛑ₜ, log𝛑ₜ = get_probs_logprobs(actor, device(𝐬ₜ)) |> cpu
             elseif ppo.actor.recurtype == TRANSFORMER
-                𝛑ₜ, log𝛑ₜ = get_probs_logprobs(actor, device(𝐬[:, 1:t, :])) |> cpu
-                𝛑ₜ, log𝛑ₜ = 𝛑ₜ[:, end, :], log𝛑ₜ[:, end, :]
+                s_t = 𝐬[:, 1:t, :]
+                if state_dim > 50
+                    s_gpu = s_t
+                else
+                    s_gpu = s_t |> device
+                end
+                𝛑ₜ, log𝛑ₜ = get_probs_logprobs(actor, s_gpu) |> cpu
+                𝛑ₜ, log𝛑ₜ = 𝛑ₜ[:, t, :], log𝛑ₜ[:, t, :]
+                s_gpu = nothing
+                s_t = nothing
             end
             𝐚ₜ = reshape([sample(rng, 1:nactions, ProbabilityWeights(𝛑ₜ[:, i])) for i in 1:N], 1, N)
             𝐚[:, t, :] = 𝐚ₜ
