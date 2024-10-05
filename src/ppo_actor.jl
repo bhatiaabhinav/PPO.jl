@@ -121,7 +121,6 @@ function get_probs_logprobs(p::PPOActorDiscrete{T}, 𝐬::AbstractArray{Float32}
         logits = p.actor_model(𝐬)
     else
         # interpret as (state_dim, ntimesteps, batch_size) for the RNN
-        Flux.Zygote.@ignore Flux.reset!(p.actor_model)
         logits = mapfoldl(hcat, 1:size(𝐬, 2)) do t
             return reshape(p.actor_model(𝐬[:, t, :]), :, 1, size(𝐬, 3))
         end
@@ -250,7 +249,6 @@ function get_mean_logstd(p::PPOActorContinuous{Tₛ, Tₐ}, 𝐬::AbstractArray{
         𝛍 = p.actor_model(𝐬)
     else
         # interpret as (state_dim, ntimesteps, batch_size)
-        Flux.Zygote.@ignore Flux.reset!(p.actor_model)
         𝛍 = mapfoldl(hcat, 1:size(𝐬, 2)) do t
             reshape(p.actor_model(𝐬[:, t, :]), :, 1, size(𝐬, 3))
         end
@@ -358,8 +356,7 @@ function MDPs.preepisode(p::PPOActor; env, kwargs...)
         if isnothing(p.observation_history)
             p.observation_history = zeros(Float32, length(s), 2) |> p.device
         end
-        p.obs_history_len = 1
-        p.observation_history[:, 1] = s
+        p.obs_history_len = 0
     end
     nothing
 end

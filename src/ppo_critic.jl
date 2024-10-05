@@ -5,7 +5,6 @@ function get_values(critic, 𝐬, recurtype::RecurrenceType)
         return critic(𝐬)
     else
         # interpret as (state_dim, ntimesteps, batch_size) for the RNN
-        Flux.Zygote.@ignore Flux.reset!(critic)
         mapfoldl(hcat, 1:size(𝐬, 2)) do t
             return reshape(critic(𝐬[:, t, :]), 1, 1, :)
         end

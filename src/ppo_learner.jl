@@ -102,6 +102,7 @@ function postepisode(ppo::PPOLearner; returns, max_trials, rng, kwargs...)
     function do_full_ppo_iteration()
         𝐬, 𝐚, 𝛑, log𝛑, 𝐫, 𝐭, 𝐝 = collect_trajectories(ppo, ppo.actor_gpu, entropy_bonus, ppo.device, rng) |> ppo.device
         if eltype(𝐚) <: Integer; 𝐚 = cpu(𝐚); end
+        Flux.reset!(ppo.critic_gpu)
         𝐯, 𝛅 = get_values_advantages(ppo, ppo.critic_gpu, 𝐬, 𝐫, 𝐭, 𝐝, ppo.γ, ppo.λ)
 
         stop_actor_training, kl = false, 0f0
@@ -118,6 +119,8 @@ function postepisode(ppo::PPOLearner; returns, max_trials, rng, kwargs...)
                 if ppo.actor.recurtype != MARKOV 
                     mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑 = map(𝐱 -> reshape(𝐱, :, M, length(mb_indices) ÷ M), (mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑))
                 end
+                Flux.reset!(ppo.actor_gpu)
+                Flux.reset!(ppo.critic_gpu)
                 ∇ = gradient(θ) do
                     mb_loss, mb_actor_loss, mb_critic_loss = ppo_loss(ppo, ppo.actor_gpu, ppo.critic_gpu, mb_𝐬, mb_𝐚, mb_𝐯, mb_𝛅, mb_𝛑, mb_log𝛑, Float32(!stop_actor_training), 0.5f0, entropy_bonus)
                     actor_loss += mb_actor_loss * length(mb_indices) / (M * N)
@@ -135,11 +138,14 @@ function postepisode(ppo::PPOLearner; returns, max_trials, rng, kwargs...)
             push!(critic_losses, critic_loss)
             if !stop_actor_training
                 push!(actor_losses, actor_loss)
+                Flux.reset!(ppo.actor_gpu)
                 kl = get_kl_div(ppo.actor_gpu, 𝐬, 𝐚, 𝛑, log𝛑)
                 stop_actor_training = kl >= ppo.kl_target
             end
             stop_actor_training && ppo.early_stop_critic && break
         end
+        Flux.reset!(ppo.actor_gpu)
+        Flux.reset!(ppo.critic_gpu)
         H̄, v̄ = mean(get_entropy(ppo.actor_gpu, 𝐬)), mean(get_values(ppo.critic_gpu, 𝐬, ppo.actor.recurtype))
 
         Flux.loadparams!(ppo.actor, Flux.params(ppo.actor_gpu))
